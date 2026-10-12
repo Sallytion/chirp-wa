@@ -1,0 +1,28 @@
+name: Checks
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        node: [24]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+      - run: npm run verify
+      - run: npm run build
+      - run: npm run check:protocol
+      - run: npm run check:yoga
+      - run: npm run check:package
+      - run: npm pack --dry-run --ignore-scripts
+      - if: runner.os == 'Windows'
+        run: npm ci --prefix benchmarks/runner
+      - if: runner.os == 'Windows'
+        run: npm run test:terminal

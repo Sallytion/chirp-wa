@@ -1,0 +1,10 @@
+node_modules/
+dist/
+package-lock.json
+benchmarks/runner/package-lock.json
+benchmarks/*.json
+benchmarks/*.csv
+benchmarks/*.mjs
+benchmarks/protocol/
+*.tgz
+coverage/
