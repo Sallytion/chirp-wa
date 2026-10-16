@@ -2,11 +2,11 @@
 
 A keyboard-first WhatsApp client for your terminal. Browse conversations, search local history, reply, and preview images without leaving your workspace.
 
-[![Node.js 24+](https://img.shields.io/badge/Node.js-24%2B-339933?logo=nodedotjs&logoColor=white)](https://nodejs.org/) [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![npm](https://img.shields.io/npm/v/chirp-wa?logo=npm)](https://www.npmjs.com/package/chirp-wa) [![Node.js 24+](https://img.shields.io/badge/Node.js-24%2B-339933?logo=nodedotjs&logoColor=white)](https://nodejs.org/) [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 [Source](https://github.com/Sallytion/chirp-wa) · [Issues](https://github.com/Sallytion/chirp-wa/issues) · [Contributing](CONTRIBUTING.md)
 
-**npm package:** `chirp-wa` · **command:** `chirp` · **initial release:** `0.1.0`
+**npm package:** [`chirp-wa`](https://www.npmjs.com/package/chirp-wa) · **command:** `chirp` · **changes:** [changelog](CHANGELOG.md)
 
 Built with TypeScript, React/Ink, and Baileys. Runs locally in one process with SQLite history.
 
@@ -19,7 +19,13 @@ npm i -g chirp-wa
 chirp
 ```
 
-> The initial release is prepared locally and has not been published yet. The registry command above will work after publication. To try this checkout now, use the development instructions below.
+Update to the latest release the same way:
+
+```sh
+npm i -g chirp-wa@latest
+```
+
+Profiles are upgraded automatically the first time a new version opens them. Version 0.2.0 builds a search index for existing history, which can take a moment on large histories.
 
 Explore the interface without linking WhatsApp:
 
@@ -173,7 +179,7 @@ npm run check:package
 
 See [Contributing](CONTRIBUTING.md), [Architecture](docs/architecture.md), [Performance](docs/performance.md), and [Releasing](docs/releasing.md). Production optimizations are checked against pinned dependencies; source development runs do not use every build adaptation.
 
-`npm pack` creates the single current release artifact, `chirp-wa-0.1.0.tgz`. Install it on another machine with `npm i -g ./chirp-wa-0.1.0.tgz`.
+`npm pack` creates the current release artifact, `chirp-wa-<version>.tgz`. Install it on another machine with `npm i -g ./chirp-wa-<version>.tgz`.
 
 ## License
 

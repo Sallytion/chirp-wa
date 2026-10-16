@@ -1,14 +1,7 @@
 # Changelog
 
-## 0.1.0 — Initial release (unreleased)
+## 0.2.0 — 2026-10-16
 
-- Introduce Chirp for WhatsApp, published as `chirp-wa` with the `chirp` command.
-- Provide QR and phone pairing, independent profiles, and automatic reconnects.
-- Add a keyboard-driven terminal interface with Chats and Channels pages, local history, search, and saved text drafts.
-- Support messages, replies, reactions, edits, forwarding, attachments, group management, and poll creation.
-- Include terminal image previews, clipboard attachments, emoji completion, and Unicode-aware editing.
-- Keep account archives and logout recovery local to each profile.
-- Ship a production bundle with bounded caches and on-demand protocol and image processing.
 - Search history with a trigram full-text index; results load in pages as you scroll.
 - Vote in polls, decrypt received votes, and show live tallies with your own choice marked.
 - Show the quoted sender and text on replies, complete @ mentions in groups, and render mentions as names.
@@ -20,5 +13,16 @@
 - Refuse to open executable or script attachments externally, and strip bidi overrides from untrusted text.
 - Write downloads atomically with a byte limit, delete sent or discarded clipboard images, and keep the newest status notice visible.
 - Accept apostrophes in slash command arguments and stop printing Node's SQLite experimental warning.
+- Upgrade profiles to schema 5 on first launch, building the search index for existing history.
 
-This is the first Chirp release. Development snapshots are not published releases.
+## 0.1.0 — 2026-10-12
+
+- Introduce Chirp for WhatsApp, published as `chirp-wa` with the `chirp` command.
+- Provide QR and phone pairing, independent profiles, and automatic reconnects.
+- Add a keyboard-driven terminal interface with Chats and Channels pages, local history, search, and saved text drafts.
+- Support messages, replies, reactions, edits, forwarding, attachments, group management, and poll creation.
+- Include terminal image previews, clipboard attachments, emoji completion, and Unicode-aware editing.
+- Keep account archives and logout recovery local to each profile.
+- Ship a production bundle with bounded caches and on-demand protocol and image processing.
+
+This was the first Chirp release.

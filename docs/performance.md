@@ -37,6 +37,6 @@ npm ci --prefix benchmarks/runner
 npm run test:terminal
 ```
 
-Chirp 0.1.0 has no published memory guarantee. Development-era measurements are not release benchmarks. Startup, history sync, emoji indexing, and media previews can increase process memory.
+Chirp has no published memory guarantee. Development-era measurements are not release benchmarks. Startup, history sync, emoji indexing, and media previews can increase process memory.
 
 For Windows process measurements, run `scripts/measure-memory.ps1` in another terminal with an absolute CLI path and a fresh output filename. Record the version, Node runtime, terminal dimensions, history size, workload, and sample timestamps. Working set and private allocation overlap and must not be added together. Keep real-account records local.

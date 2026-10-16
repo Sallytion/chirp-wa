@@ -1,6 +1,6 @@
 # Releasing chirp-wa
 
-The package name is `chirp-wa`; its executable is `chirp`. Version 0.1.0 is the initial release candidate. The source repository is [Sallytion/chirp-wa](https://github.com/Sallytion/chirp-wa). The npm package has not been published.
+The package name is `chirp-wa`; its executable is `chirp`. The source repository is [Sallytion/chirp-wa](https://github.com/Sallytion/chirp-wa). Releases are published to npm; [the changelog](../CHANGELOG.md) lists each version.
 
 ## Recommended order
 
@@ -28,7 +28,7 @@ npm pack
 
 `npm pack` rebuilds and checks package contents. The package includes the production entry point, bundled chunks, lazy protocol factories, public documentation, and licenses. Source maps, tests, local profiles, and benchmark records are excluded.
 
-Install `chirp-wa-0.1.0.tgz` into a temporary npm prefix and run its generated `chirp` command with `--version`, `--help`, and `--demo`. Check a fresh profile's login screen before publishing. Do not use your everyday account for automated outbound tests.
+Install `chirp-wa-<version>.tgz` into a temporary npm prefix and run its generated `chirp` command with `--version`, `--help`, and `--demo`. Check a fresh profile's login screen before publishing. Do not use your everyday account for automated outbound tests.
 
 ## Publish later
 
@@ -36,10 +36,12 @@ Check the current npm requirements and package-name availability immediately bef
 
 ```sh
 npm login
-npm publish ./chirp-wa-0.1.0.tgz --access public
+npm publish ./chirp-wa-<version>.tgz --access public
 ```
 
-Published versions cannot be overwritten. Update the package and lockfile versions together for future releases, and keep one changelog entry per release. Mark the initial changelog entry with its actual publication date after release.
+If `npm publish` fails with `E404 Not Found` or `npm whoami` reports `401 Unauthorized`, the saved npm login has expired. Run `npm login` and publish again.
+
+Published versions cannot be overwritten. Update the package and lockfile versions together for future releases, and keep one changelog entry per release. Date each changelog entry with its publication day.
 
 After publication, verify the public installation in a clean environment:
 
