@@ -60,6 +60,17 @@ export interface Settings {
   autoRead: boolean;
   notifications: boolean;
   theme: 'dark' | 'light';
+  // Optional so older settings objects keep their previous behavior.
+  typing?: boolean;
+  images?: 'auto' | 'kitty' | 'blocks';
+}
+export interface Participant {
+  jid: string;
+  name: string;
+}
+// Chat.muted holds the unmute time in Unix seconds; -1 means always muted.
+export function isMuted(chat: Pick<Chat, 'muted'> | undefined, now = Date.now()): boolean {
+  return !!chat && (chat.muted < 0 || chat.muted > now / 1000);
 }
 export interface Client {
   state: ClientState;
@@ -78,6 +89,8 @@ export interface Client {
   ): Promise<void>;
   read(jid: string, messages: Message[]): Promise<void>;
   typing(jid: string, active: boolean): Promise<void>;
+  // Subscribe to a contact's presence without announcing a chat state.
+  watchPresence(jid: string): Promise<void>;
   history(jid: string, oldest?: Message): Promise<void>;
   syncContacts(): Promise<string>;
   download(message: Message): Promise<string>;
@@ -85,13 +98,14 @@ export interface Client {
   edit(message: Message, text: string): Promise<void>;
   delete(message: Message): Promise<void>;
   forward(message: Message, jid: string): Promise<void>;
-  modifyChat(
-    jid: string,
-    action: 'archive' | 'pin' | 'mute' | 'unread',
-    value: boolean,
-  ): Promise<void>;
+  modifyChat(jid: string, action: 'archive' | 'pin' | 'unread', value: boolean): Promise<void>;
+  // Mute for a number of seconds, -1 for always, or null to unmute.
+  mute(jid: string, seconds: number | null): Promise<void>;
   group(jid: string, action: string, args: string[]): Promise<string>;
+  participants(jid: string): Promise<Participant[]>;
   poll(jid: string, title: string, options: string[]): Promise<void>;
+  // Option indexes are zero-based; an empty list removes your vote.
+  vote(message: Message, options: number[]): Promise<void>;
   logout(): Promise<void>;
 }
 export const keyOf = (m: Message): WAMessageKey => m.raw.key;

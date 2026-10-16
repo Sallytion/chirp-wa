@@ -24,7 +24,9 @@ const terminal = new xterm.Terminal({ cols: 140, rows: 40, scrollback: 0, allowP
 const flags = readFileSync(cli, 'utf8')
   .split('\n')[0]
   .split(/\s+/)
-  .filter((value) => /^--(?:max-semi-space-size=\d+|optimize-for-size)$/.test(value));
+  .filter((value) =>
+    /^--(?:max-semi-space-size=\d+|optimize-for-size|disable-warning=\w+)$/.test(value),
+  );
 const child = pty.spawn(
   process.execPath,
   [...flags, cli, '--offline', '--data-dir', root, '--profile', 'fixture'],

@@ -1,11 +1,13 @@
 import { EventEmitter } from 'node:events';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { Jimp } from 'jimp';
 import { join, resolve } from 'node:path';
 import { stat } from 'node:fs/promises';
 import mime from 'mime-types';
-import type { Client, ClientState, Message } from './types.js';
+import type { Client, ClientState, Message, Participant } from './types.js';
 import { Store } from './store.js';
+import { pollLimit, pollOf } from './messages.js';
+import { MAX_MEDIA_BYTES } from './media.js';
 
 export const DEMO_JID = '919876543210@s.whatsapp.net';
 export const DEMO_CHANNEL_JID = '120363000000001@newsletter';
@@ -131,6 +133,53 @@ export class DemoClient implements Client {
         messageTimestamp: now - 90,
         message: { conversation: 'The terminal layout looks clean. Ready for a review?' },
       });
+      const group = '120363000000000001@g.us';
+      this.store.ingest({
+        key: { remoteJid: group, id: 'group-poll', participant: DEMO_JID, fromMe: false },
+        pushName: 'Maya',
+        messageTimestamp: now - 80,
+        message: {
+          pollCreationMessage: {
+            name: 'Review day?',
+            options: [{ optionName: 'Tuesday' }, { optionName: 'Thursday' }],
+            selectableOptionsCount: 1,
+          },
+        },
+        pollUpdates: [
+          {
+            pollUpdateMessageKey: {
+              remoteJid: group,
+              id: 'group-vote',
+              participant: '919000000002@s.whatsapp.net',
+              fromMe: false,
+            },
+            vote: { selectedOptions: [createHash('sha256').update('Thursday').digest()] },
+            senderTimestampMs: (now - 75) * 1000,
+          },
+        ],
+      });
+      this.store.ingest({
+        key: {
+          remoteJid: group,
+          id: 'group-2',
+          participant: '919000000002@s.whatsapp.net',
+          fromMe: false,
+        },
+        pushName: 'Arjun',
+        messageTimestamp: now - 70,
+        message: {
+          extendedTextMessage: {
+            text: 'Yes! Draft notes: https://example.com/chirp-review',
+            contextInfo: {
+              stanzaId: 'group-1',
+              participant: DEMO_JID,
+              quotedMessage: {
+                conversation: 'The terminal layout looks clean. Ready for a review?',
+              },
+            },
+          },
+        },
+      });
       this.store.ingest({
         key: { remoteJid: '919000000001@s.whatsapp.net', id: 'mom-1', fromMe: false },
         pushName: 'Mom',
@@ -181,13 +230,23 @@ export class DemoClient implements Client {
     this.store.recoverContactNames();
     return 'Demo contact names are up to date.';
   }
-  async send(jid: string, text: string, quoted?: Message) {
+  async send(jid: string, text: string, quoted?: Message, mentions?: string[]) {
+    const contextInfo = {
+      ...(quoted
+        ? {
+            stanzaId: quoted.id,
+            participant: quoted.fromMe ? undefined : quoted.raw.key.participant || quoted.jid,
+            quotedMessage: quoted.raw.message,
+          }
+        : {}),
+      ...(mentions?.length ? { mentionedJid: mentions } : {}),
+    };
     const raw = {
       key: { remoteJid: jid, id: randomUUID(), fromMe: true },
       messageTimestamp: Math.floor(Date.now() / 1000),
       status: 2,
-      message: quoted
-        ? { extendedTextMessage: { text, contextInfo: { stanzaId: quoted.id } } }
+      message: Object.keys(contextInfo).length
+        ? { extendedTextMessage: { text, contextInfo } }
         : { conversation: text },
     };
     this.store.ingest(raw);
@@ -205,7 +264,7 @@ export class DemoClient implements Client {
   async sendFile(jid: string, path: string, caption = '', voice = false, quoted?: Message) {
     const file = resolve(path);
     const info = await stat(file);
-    if (!info.isFile() || info.size > 100 * 1024 * 1024)
+    if (!info.isFile() || info.size > MAX_MEDIA_BYTES)
       throw new Error('Select a file under 100 MB.');
     const id = randomUUID();
     this.media.set(id, file);
@@ -231,6 +290,7 @@ export class DemoClient implements Client {
     this.store.readLocal(jid, messages);
   }
   async typing() {}
+  async watchPresence() {}
   async history() {
     this.state = {
       ...this.state,
@@ -257,23 +317,69 @@ export class DemoClient implements Client {
   async forward(m: Message, jid: string) {
     await this.send(jid, m.text);
   }
-  async modifyChat(jid: string, action: 'archive' | 'pin' | 'mute' | 'unread', value: boolean) {
+  async modifyChat(jid: string, action: 'archive' | 'pin' | 'unread', value: boolean) {
     this.store.upsertChat({
       jid,
       ...(action === 'archive'
         ? { archived: value }
         : action === 'pin'
           ? { pinned: value ? 1 : 0 }
-          : action === 'mute'
-            ? { muted: value ? Number.MAX_SAFE_INTEGER : 0 }
-            : { unread: value ? 1 : 0 }),
+          : { unread: value ? 1 : 0 }),
+    });
+  }
+  async mute(jid: string, seconds: number | null) {
+    this.store.upsertChat({
+      jid,
+      muted:
+        seconds == null
+          ? 0
+          : seconds < 0
+            ? -1
+            : Math.floor(Date.now() / 1000) + Math.floor(seconds),
     });
   }
   async group(jid: string) {
     return `Demo group\n${jid}\nMaya · member\nYou · admin`;
   }
+  async participants(jid: string): Promise<Participant[]> {
+    if (!jid.endsWith('@g.us')) return [];
+    return [DEMO_JID, '919000000002@s.whatsapp.net', '919000000001@s.whatsapp.net'].map(
+      (participant) => ({ jid: participant, name: this.store.name(participant) }),
+    );
+  }
   async poll(jid: string, title: string, options: string[]) {
-    await this.send(jid, `Poll: ${title}\n${options.map((o, i) => `${i + 1}. ${o}`).join('\n')}`);
+    this.store.ingest({
+      key: { remoteJid: jid, id: randomUUID(), fromMe: true },
+      messageTimestamp: Math.floor(Date.now() / 1000),
+      status: 2,
+      message: {
+        pollCreationMessage: {
+          name: title,
+          options: options.map((optionName) => ({ optionName })),
+          selectableOptionsCount: 1,
+        },
+      },
+    });
+  }
+  async vote(m: Message, options: number[]) {
+    const poll = pollOf(m.raw);
+    if (m.kind !== 'poll' || !poll) throw new Error('Select a poll to vote.');
+    const names = (poll.options || []).map((o) => o.optionName || '');
+    if (options.some((i) => i < 0 || i >= names.length))
+      throw new Error(`Choose options between 1 and ${names.length}.`);
+    const limit = pollLimit(poll);
+    if (limit && options.length > limit) throw new Error('This poll allows one choice.');
+    this.store.updateRaw(m.raw.key, {
+      pollUpdates: [
+        {
+          pollUpdateMessageKey: { remoteJid: m.jid, id: randomUUID(), fromMe: true },
+          vote: {
+            selectedOptions: options.map((i) => createHash('sha256').update(names[i]).digest()),
+          },
+          senderTimestampMs: Date.now(),
+        },
+      ],
+    });
   }
   async logout() {
     for (const timer of this.timers) clearTimeout(timer);

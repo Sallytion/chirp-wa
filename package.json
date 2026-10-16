@@ -21,11 +21,11 @@
     "node": ">=24.0.0"
   },
   "scripts": {
-    "dev": "tsx src/cli.tsx",
-    "start": "node --max-semi-space-size=1 --optimize-for-size dist/cli.js",
+    "dev": "tsx --disable-warning=ExperimentalWarning src/cli.tsx",
+    "start": "node --max-semi-space-size=1 --optimize-for-size --disable-warning=ExperimentalWarning dist/cli.js",
     "build": "tsc -p tsconfig.json && node scripts/build.mjs",
     "check": "tsc --noEmit",
-    "test": "tsx --test test/*.test.ts test/*.test.tsx",
+    "test": "tsx --disable-warning=ExperimentalWarning --test test/*.test.ts test/*.test.tsx",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "verify": "npm run format:check && npm run check && npm test",

@@ -40,21 +40,22 @@ chirp --phone +919876543210
 chirp --profile work
 chirp --offline
 chirp doctor
+chirp cache --clear
 ```
 
 Profiles keep independent authentication, history, preferences, drafts, and media. Only one process can open a profile at a time. Offline mode browses cached data without connecting.
 
 ## Features
 
-- **Conversations:** direct chats and groups, unread navigation, archive/pin/mute actions, and a separate channel browsing page.
-- **Messaging:** text, quoted replies, mentions, reactions, edits, deletion of your own messages, and forwarding.
-- **Local history:** SQLite persistence, chronological pagination, cached search, JSON exports, saved text drafts, and local bookmarks.
-- **Attachments:** images, video, audio, documents, stickers, clipboard images, captions, authenticated downloads, and terminal image previews.
-- **Groups and polls:** group creation and participant management, invite links, disappearing-message settings, poll creation, and received vote totals.
-- **Keyboard workflow:** fixed composer, action menus, search dialogs, emoji autocomplete, grapheme-safe editing, and light/dark themes.
-- **Connection status:** background sync progress, typing/recording indicators, receipt details, and an optional terminal notification bell.
+- **Conversations:** direct chats and groups, unread navigation, archive/pin actions, muting for 8 hours, 1 week, or always (marked ⊘ in the sidebar), and a separate channel browsing page.
+- **Messaging:** text, replies that show the quoted sender and text, @ mention completion in groups, reactions, edits, deletion of your own messages, and forwarding.
+- **Local history:** SQLite persistence, chronological pagination, fast full-text search with paged results, JSON exports, saved text drafts, and local bookmarks.
+- **Attachments:** images, video, audio, documents, stickers, clipboard images, captions, authenticated downloads, readable shared contact cards, opening web links from messages, and terminal image previews (kitty graphics protocol where supported, colored blocks elsewhere).
+- **Groups and polls:** group creation and participant management, invite links, disappearing-message settings, poll creation, voting, and live vote totals.
+- **Keyboard workflow:** fixed composer, action menus, search dialogs, emoji and mention autocomplete, grapheme-safe editing, and light/dark themes.
+- **Privacy and status:** automatic read receipts pause while the terminal is in the background, optional typing indicators, background sync progress, typing/recording indicators, receipt details, and an optional terminal notification bell.
 
-A wide terminal shows a sidebar; compact terminals use the chat switcher. True-color support improves image previews.
+A wide terminal shows a sidebar; compact terminals use the chat switcher. True-color support improves block image previews; kitty and Ghostty show full-resolution previews.
 
 ## Keyboard guide
 
@@ -71,6 +72,7 @@ A wide terminal shows a sidebar; compact terminals use the chat switcher. True-c
 | Ctrl+T             | Attach a file                                             |
 | Ctrl+V             | Paste text or attach a clipboard image                    |
 | Ctrl+P             | Preview selected media or an image draft                  |
+| L / V              | Open a link / vote in a poll (selected message)           |
 | Enter              | Send from the composer                                    |
 | Alt+Enter / Ctrl+J | Insert a newline                                          |
 | Ctrl+W             | Delete the previous word                                  |
@@ -79,7 +81,7 @@ A wide terminal shows a sidebar; compact terminals use the chat switcher. True-c
 | Esc                | Close a dialog, cancel a reply, or discard an image draft |
 | Ctrl+Q / Ctrl+C    | Quit and save text drafts                                 |
 
-Type `:smile`, `:heart`, or another shortcode for emoji suggestions. Use ↑ / ↓ to select and Tab / Enter to insert; press Enter again to send. Clipboard images attach without sending automatically.
+Type `:smile`, `:heart`, or another shortcode for emoji suggestions. In groups, type `@` and part of a name for mention suggestions; the mention is inserted as `@number` and shown as the contact's name once sent. Use ↑ / ↓ to select and Tab / Enter to insert; press Enter again to send. Clipboard images attach without sending automatically.
 
 Use the **Control** key on macOS. Terminals may intercept Ctrl+V or some Alt/Option shortcuts; the action menu provides equivalent flows. Channels are read-only and retain their navigation separately from Chats. Text drafts persist across restarts; unsent clipboard image drafts do not.
 
@@ -93,8 +95,14 @@ Slash commands are optional. `/help` lists the full reference; `//text` sends a 
 /attach "path/to/photo.jpg" "From today"
 /react 💚
 /poll "Dinner?" "Pizza" "Pasta"
+/vote 2
+/mute 8h
+/links
 /group info
 /receipts off
+/typing off
+/images kitty
+/cache clear
 /export "conversation.json"
 ```
 
@@ -102,7 +110,11 @@ Slash commands are optional. `/help` lists the full reference; `//text` sends a 
 
 Desktop clipboard access uses the optional [CrossCopy backend](https://github.com/CrossCopy/clipboard). On Linux Wayland, install `wl-clipboard`; the X11 fallback uses `xclip`. If clipboard support is unavailable, use Ctrl+T to attach a file. Remote sessions need access to their own desktop clipboard.
 
-Clipboard images are limited to 32 MB and 40 million pixels. Attachment uploads and declared download sizes are limited to 100 MB. Images and stickers render in the terminal; other media can open in your system viewer. Voice notes require an existing Ogg/Opus file. Protected view-once media opens through official WhatsApp.
+Clipboard images are limited to 32 MB and 40 million pixels. Attachment uploads and downloads are limited to 100 MB. Images and stickers render in the terminal; other media can open in your system viewer. Chirp refuses to open executables and scripts (for example `.exe`, `.js`, `.sh`) with the system handler; save them with `/download` instead. Voice notes require an existing Ogg/Opus file. Protected view-once media opens through official WhatsApp.
+
+Image previews use the kitty graphics protocol (Unicode placeholders) in kitty and Ghostty, and colored half-blocks elsewhere, including inside tmux or screen. Choose with `/images auto|kitty|blocks` or in Preferences.
+
+Downloaded media is cached in the profile so previews open instantly. `/cache` shows its size and `/cache clear` removes it; while Chirp is closed, use `chirp cache` and `chirp cache --clear`. Attachments download again when opened. Pasted clipboard images are deleted after they are sent or discarded.
 
 ## Local data
 
@@ -131,7 +143,9 @@ For a broken local session while Chirp is closed, `chirp logout --yes` archives 
 - WhatsApp controls which historical messages and media a linked device receives. Search and export use cached data; a complete lifetime archive is not guaranteed.
 - Receipt visibility depends on WhatsApp events and privacy settings. Disabling automatic receipts here changes Chirp's behavior, not account-wide privacy settings.
 - Channels display locally synced updates. Publishing, following/unfollowing, channel reactions, and full channel archive retrieval are not implemented.
-- Calls, microphone recording, built-in video/audio playback, poll voting, status stories, business catalogs, desktop notifications, and WhatsApp-synced stars are not implemented. Bookmarks are local.
+- Calls, microphone recording, built-in video/audio playback, status stories, business catalogs, desktop notifications, and WhatsApp-synced stars are not implemented. Bookmarks are local.
+- Poll votes use the same encryption Baileys uses to decrypt them and follow the poll's phone-number or LID addressing. They have not yet been tested against the official WhatsApp apps.
+- Read receipts pause in the background only in terminals that report focus changes (most modern terminals); elsewhere Chirp assumes the window is focused.
 - Baileys is an unofficial client library pinned to `7.0.0-rc14`. WhatsApp protocol changes can affect compatibility. Chirp is not affiliated with WhatsApp or Meta.
 
 ## Development

@@ -1,9 +1,14 @@
 import React from 'react';
 import { Box, Text } from 'ink';
-import type { EmojiSuggestion } from '../emoji.js';
 import { fit } from './layout.js';
 
-export function EmojiSuggestions({
+export interface Suggestion {
+  key: string;
+  label: string;
+}
+// Composer completions (emoji shortcodes and group mentions) above the input.
+export function Suggestions({
+  title,
   items,
   index,
   count,
@@ -12,7 +17,8 @@ export function EmojiSuggestions({
   muted,
   highlight,
 }: {
-  items: EmojiSuggestion[];
+  title: string;
+  items: Suggestion[];
   index: number;
   count: number;
   width: number;
@@ -30,20 +36,17 @@ export function EmojiSuggestions({
     >
       <Text color={muted}>
         {fit(
-          `Emoji · ↑ ↓ select · Tab / Enter insert · Esc dismiss · ${index + 1}/${items.length}`,
+          `${title} · ↑ ↓ select · Tab / Enter insert · Esc dismiss · ${index + 1}/${items.length}`,
           width - 4,
         )}
       </Text>
       {items.slice(start, start + count).map((item, i) => (
         <Text
-          key={item.emoji}
+          key={item.key}
           color={start + i === index ? accent : muted}
           backgroundColor={start + i === index ? highlight : undefined}
         >
-          {fit(
-            `${start + i === index ? '›' : ' '} ${item.emoji}  :${item.shortcode}:  ${item.label}`,
-            width - 4,
-          )}
+          {fit(`${start + i === index ? '›' : ' '} ${item.label}`, width - 4)}
         </Text>
       ))}
     </Box>

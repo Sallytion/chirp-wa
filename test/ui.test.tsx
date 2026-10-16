@@ -461,7 +461,7 @@ test('logout is accessible on both pages, cancellation is harmless, and confirma
     await delay();
     ui.stdin.write('\x1ba');
     await delay();
-    ui.stdin.write('\x1b[B'.repeat(11));
+    ui.stdin.write('\x1b[B'.repeat(13));
     await delay();
     assert.match(ui.lastFrame()!, /Log out \/ link another account/);
     ui.stdin.write('\r');

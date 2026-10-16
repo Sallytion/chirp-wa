@@ -5,11 +5,23 @@ export function isTerminalBackspace(sequence: string): boolean {
   return /^(?:\x1b)?[\x08\x7f]$/.test(sequence) || /^\x1b\[(?:8|127)(?=[:;u])/.test(sequence);
 }
 
-export function useTerminalInput(handler: Parameters<typeof useInput>[0]) {
+// Focus reporting (DECSET 1004) sends ESC [ I on focus and ESC [ O on blur.
+export const FOCUS_REPORTING_ON = '\x1b[?1004h';
+export const FOCUS_REPORTING_OFF = '\x1b[?1004l';
+export function focusEvent(sequence: string): boolean | undefined {
+  return sequence === '\x1b[I' ? true : sequence === '\x1b[O' ? false : undefined;
+}
+
+export function useTerminalInput(
+  handler: Parameters<typeof useInput>[0],
+  onFocus?: (focused: boolean) => void,
+) {
   const { internal_eventEmitter } = useStdin();
   const sequence = useRef('');
   const handlerRef = useRef(handler);
   handlerRef.current = handler;
+  const focusRef = useRef(onFocus);
+  focusRef.current = onFocus;
   // Ink removes the original sequence before calling useInput. Observe its parsed
   // input events first so legacy DEL Backspace stays distinct from CSI Delete.
   useEffect(() => {
@@ -23,6 +35,12 @@ export function useTerminalInput(handler: Parameters<typeof useInput>[0]) {
   }, [internal_eventEmitter]);
   const onInput = useCallback<Parameters<typeof useInput>[0]>((input, key) => {
     if (key.eventType === 'release') return;
+    // Ink would otherwise deliver focus reports as the text "[I" / "[O".
+    const focused = focusEvent(sequence.current);
+    if (focused !== undefined) {
+      focusRef.current?.(focused);
+      return;
+    }
     // Terminals can coalesce typed text and Backspace into one input chunk.
     if (!key.meta && !key.ctrl && /[\x08\x7f]/.test(input)) {
       for (const part of input.split(/([\x08\x7f])/).filter(Boolean)) {

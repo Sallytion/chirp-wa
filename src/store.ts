@@ -25,6 +25,14 @@ const ranks: Record<ReceiptStatus, number> = {
 };
 const activeConversation =
   '(EXISTS (SELECT 1 FROM messages WHERE messages.jid=chats.jid AND visible=1) OR NOT EXISTS (SELECT 1 FROM messages WHERE messages.jid=chats.jid))';
+// WhatsApp reports mute ends in milliseconds (history sync can use seconds),
+// -1 for "always" and null after unmuting. Chats store Unix seconds.
+export function muteSeconds(value: unknown): number {
+  if (value == null) return 0;
+  const n = numeric(value);
+  if (n < 0) return -1;
+  return n > 1e11 ? Math.floor(n / 1000) : n;
+}
 
 export class Store {
   db: DatabaseSync;
@@ -44,7 +52,11 @@ export class Store {
   }
   constructor(path: string) {
     this.db = new DatabaseSync(path);
-    this.db.exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;
+    // recursive_triggers makes REPLACE conflicts fire delete triggers, which keeps
+    // the external-content search index consistent with the messages table.
+    this.db
+      .exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000; PRAGMA recursive_triggers=ON;
+      CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS chats(jid TEXT PRIMARY KEY,name TEXT NOT NULL,timestamp INTEGER DEFAULT 0,unread INTEGER DEFAULT 0,archived INTEGER DEFAULT 0,pinned INTEGER DEFAULT 0,muted INTEGER DEFAULT 0,preview TEXT DEFAULT '');
       CREATE TABLE IF NOT EXISTS messages(jid TEXT NOT NULL,id TEXT NOT NULL,from_me INTEGER NOT NULL,timestamp INTEGER NOT NULL,text TEXT NOT NULL,data TEXT NOT NULL,PRIMARY KEY(jid,id,from_me));
       CREATE INDEX IF NOT EXISTS messages_history ON messages(jid,timestamp DESC,id DESC);
@@ -71,7 +83,7 @@ export class Store {
           this.db.exec('ALTER TABLE contacts ADD COLUMN name_rank INTEGER NOT NULL DEFAULT 3');
         for (const row of this.statement('SELECT alias,jid FROM aliases').all())
           this.mergeContact(String(row.alias), String(row.jid));
-        this.recoverContactNames();
+        this.recoverContactNames(true);
         this.db.exec('PRAGMA user_version=2');
       });
     }
@@ -107,6 +119,27 @@ export class Store {
         }
         for (const [jid, excluded] of affected) this.refreshSummary(jid, excluded);
         this.db.exec('PRAGMA user_version=4');
+      });
+    }
+    if (version < 5) {
+      // Trigram full-text search keeps substring semantics (including Indic
+      // and CJK text) without scanning every message. Created after older
+      // migrations so their writes cannot touch an unbuilt index.
+      this.transaction(() => {
+        this.db
+          .exec(`CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(text, content='messages', content_rowid='rowid', tokenize='trigram');
+          CREATE TRIGGER IF NOT EXISTS messages_fts_insert AFTER INSERT ON messages BEGIN
+            INSERT INTO messages_fts(rowid,text) VALUES(new.rowid,new.text);
+          END;
+          CREATE TRIGGER IF NOT EXISTS messages_fts_delete AFTER DELETE ON messages BEGIN
+            INSERT INTO messages_fts(messages_fts,rowid,text) VALUES('delete',old.rowid,old.text);
+          END;
+          CREATE TRIGGER IF NOT EXISTS messages_fts_update AFTER UPDATE OF text ON messages BEGIN
+            INSERT INTO messages_fts(messages_fts,rowid,text) VALUES('delete',old.rowid,old.text);
+            INSERT INTO messages_fts(rowid,text) VALUES(new.rowid,new.text);
+          END;
+          INSERT INTO messages_fts(messages_fts) VALUES('rebuild');
+          PRAGMA user_version=5;`);
       });
     }
     if (path !== ':memory:') {
@@ -256,18 +289,37 @@ export class Store {
     if (!sender || !(sender.endsWith('@lid') || sender.endsWith('@s.whatsapp.net'))) return;
     this.writeContact(this.resolve(sender), raw.pushName, 1);
   }
-  recoverContactNames(): number {
+  // Ingestion already remembers sender names, so the full history scan is only
+  // needed once per profile (for history cached before that existed) or on demand.
+  recoverContactNames(force = false): number {
+    const recovered = this.statement("SELECT 1 FROM meta WHERE key='contacts_recovered'").get();
+    if (recovered && !force) {
+      this.transaction(() => this.refreshChatNames());
+      return 0;
+    }
     const before = Number(this.statement('SELECT count(*) AS n FROM contacts').get()?.n || 0);
     this.transaction(() => {
       for (const row of this.statement('SELECT data FROM messages ORDER BY timestamp').iterate()) {
         const message = JSON.parse(String(row.data)) as Message;
         this.rememberSender(message.raw);
       }
-      this.db.exec(
-        'UPDATE chats SET name=(SELECT name FROM contacts WHERE contacts.jid=chats.jid) WHERE jid IN (SELECT jid FROM contacts)',
-      );
+      this.refreshChatNames();
+      this.statement(
+        "INSERT OR REPLACE INTO meta(key,value) VALUES('contacts_recovered','1')",
+      ).run();
     });
     return Number(this.statement('SELECT count(*) AS n FROM contacts').get()?.n || 0) - before;
+  }
+  private refreshChatNames() {
+    this.db.exec(
+      'UPDATE chats SET name=(SELECT name FROM contacts WHERE contacts.jid=chats.jid) WHERE jid IN (SELECT jid FROM contacts)',
+    );
+  }
+  // Every address that resolves to this JID (for example a LID for a phone number).
+  aliasesOf(jid: string): string[] {
+    return this.statement('SELECT alias FROM aliases WHERE jid=?')
+      .all(this.resolve(jid))
+      .map((row) => String(row.alias));
   }
   upsertWAChat(c: Partial<WAChat> & { id: string }) {
     if (c.name && (c.id.endsWith('@lid') || c.id.endsWith('@s.whatsapp.net')))
@@ -279,7 +331,8 @@ export class Store {
       unread: c.unreadCount == null ? undefined : Math.max(0, c.unreadCount),
       archived: c.archived == null ? undefined : !!c.archived,
       pinned: c.pinned == null ? undefined : numeric(c.pinned),
-      muted: c.muteEndTime == null ? undefined : numeric(c.muteEndTime),
+      // An explicit null is an unmute; an absent field leaves the state alone.
+      muted: c.muteEndTime === undefined ? undefined : muteSeconds(c.muteEndTime),
     });
     if (this.hasBackground(c.id)) this.refreshSummary(this.resolve(c.id));
   }
@@ -407,8 +460,9 @@ export class Store {
     return row ? decode(row.data as string) : undefined;
   }
   private writeMessage(m: Message, visible = true) {
+    // An upsert keeps the rowid stable, which the full-text index refers to.
     this.statement(
-      'INSERT OR REPLACE INTO messages(jid,id,from_me,timestamp,text,data,visible) VALUES(?,?,?,?,?,?,?)',
+      'INSERT INTO messages(jid,id,from_me,timestamp,text,data,visible) VALUES(?,?,?,?,?,?,?) ON CONFLICT(jid,id,from_me) DO UPDATE SET timestamp=excluded.timestamp,text=excluded.text,data=excluded.data,visible=excluded.visible',
     ).run(m.jid, m.id, +m.fromMe, m.timestamp, m.text, encode(m), +visible);
   }
   ingest(raw: WAMessage, notify = false): boolean {
@@ -486,14 +540,15 @@ export class Store {
       for (const vote of update.pollUpdates) updateMessageWithPollUpdate(polls, vote);
     m.raw = { ...m.raw, ...update, key: m.raw.key };
     if (update.pollUpdates) m.raw.pollUpdates = polls.pollUpdates;
-    if (update.message) {
+    // Poll text includes vote totals, so votes refresh it like an edit does.
+    if ((update.message || update.pollUpdates) && !m.deleted) {
       const normalized = normalize(m.raw);
       if (normalized) {
         m.text = normalized.text;
         m.kind = normalized.kind;
       }
-      m.edited = edited || m.edited;
     }
+    if (update.message) m.edited = edited || m.edited;
     if (update.status != null) {
       const status = statusOf(update.status);
       if (status === 'failed' || ranks[status] > ranks[m.status]) m.status = status;
@@ -550,13 +605,42 @@ export class Store {
       )?.n || 0,
     );
   }
-  search(query: string, jid?: string, section: ChatSection = 'chats'): Message[] {
-    const sql =
-      "SELECT data FROM messages WHERE visible=1 AND text LIKE ? ESCAPE '\\'" +
-      (jid ? ' AND jid=?' : ` AND ${sectionClause(section)}`) +
-      ' ORDER BY timestamp DESC LIMIT 100';
-    return this.statement(sql)
-      .all(...(jid ? [like(query), this.resolve(jid)] : [like(query)]))
+  // Newest first. Queries of three or more characters use the trigram index;
+  // shorter ones are too broad for it and fall back to a LIKE scan.
+  search(
+    query: string,
+    jid?: string,
+    section: ChatSection = 'chats',
+    limit = 100,
+    offset = 0,
+  ): Message[] {
+    if (!query) return [];
+    const scope = jid ? ' AND m.jid=?' : ` AND ${sectionClause(section)}`;
+    const params = jid ? [this.resolve(jid)] : [];
+    const page = ' ORDER BY m.timestamp DESC,m.id DESC LIMIT ? OFFSET ?';
+    const rows =
+      Array.from(query).length >= 3
+        ? this.statement(
+            `SELECT m.data FROM messages_fts JOIN messages m ON m.rowid=messages_fts.rowid WHERE messages_fts MATCH ? AND m.visible=1${scope}${page}`,
+          ).all(`"${query.replace(/"/g, '""')}"`, ...params, limit, offset)
+        : this.statement(
+            `SELECT m.data FROM messages m WHERE m.visible=1 AND m.text LIKE ? ESCAPE '\\'${scope}${page}`,
+          ).all(like(query), ...params, limit, offset);
+    return rows.map((r) => decode(r.data as string));
+  }
+  // How many visible messages sort after this one (the history page offset).
+  newerCount(m: Pick<Message, 'jid' | 'id' | 'timestamp'>): number {
+    return Number(
+      this.statement(
+        'SELECT count(*) AS n FROM messages WHERE jid=? AND visible=1 AND (timestamp>? OR (timestamp=? AND id>?))',
+      ).get(this.resolve(m.jid), m.timestamp, m.timestamp, m.id)?.n || 0,
+    );
+  }
+  starred(jid: string, limit = 100): Message[] {
+    return this.statement(
+      "SELECT data FROM messages WHERE jid=? AND visible=1 AND json_extract(data,'$.starred')=1 ORDER BY timestamp DESC,id DESC LIMIT ?",
+    )
+      .all(this.resolve(jid), limit)
       .map((r) => decode(r.data as string));
   }
   readLocal(jid: string, messages: Message[]) {
@@ -594,7 +678,7 @@ export class Store {
   }
   clearAccount() {
     this.transaction(() => {
-      for (const table of ['messages', 'chats', 'contacts', 'aliases', 'drafts'])
+      for (const table of ['messages', 'chats', 'contacts', 'aliases', 'drafts', 'meta'])
         this.db.exec(`DELETE FROM ${table}`);
     });
   }

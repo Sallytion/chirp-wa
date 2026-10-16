@@ -6,6 +6,8 @@ Production builds differ from source development runs. Measure the built CLI whe
 
 - Cache at most 128 SQLite prepared statements and invalidate cached counts after database changes.
 - Decode the current 60-message history page and memoize transcript rendering across editor updates.
+- Search through a trigram FTS5 index instead of scanning every message, page results 50 at a time, and memoize dialog queries on the database revision.
+- Scan history for contact names once per profile rather than on every connection.
 - Reuse date formatters and Unicode segmenters.
 - Load the emoji index on first completion request and image processing on demand.
 - Bound signal-key RAM caching to 1,024 entries with a five-minute TTL and group metadata to 128 entries. Evicted signal keys remain in persistent authentication storage.

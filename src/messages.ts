@@ -1,7 +1,112 @@
-import { normalizeMessageContent, proto } from '@whiskeysockets/baileys';
+import {
+  getAggregateVotesInPollMessage,
+  normalizeMessageContent,
+  proto,
+} from '@whiskeysockets/baileys';
 import type { WAMessage } from '@whiskeysockets/baileys';
 import type { Message, MessageKind, ReceiptStatus } from './types.js';
 import { safeText } from './util.js';
+
+// Shared contact cards arrive as raw vCards; show the name, organisation,
+// phone numbers and email addresses instead of the vCard source.
+export function vcardText(
+  displayName: string | null | undefined,
+  vcard: string | null | undefined,
+) {
+  let name = displayName || '';
+  let org = '';
+  const phones: string[] = [];
+  const emails: string[] = [];
+  const unescape = (value: string) =>
+    value
+      .replace(/\\n/gi, ' ')
+      .replace(/\\([,;:\\])/g, '$1')
+      .trim();
+  for (const line of String(vcard || '')
+    .replace(/\r?\n[ \t]/g, '')
+    .split(/\r?\n/)) {
+    const separator = line.indexOf(':');
+    if (separator < 0) continue;
+    const head = line.slice(0, separator);
+    const value = unescape(line.slice(separator + 1));
+    const property = head.split(';')[0].split('.').pop()!.toUpperCase();
+    if (property === 'FN' && !name) name = value;
+    else if (property === 'ORG') org = value.replace(/;+/g, ' ').trim();
+    else if (property === 'TEL') {
+      const waid = /waid=(\d+)/i.exec(head)?.[1];
+      const phone = value || (waid ? `+${waid}` : '');
+      if (phone) phones.push(phone);
+    } else if (property === 'EMAIL' && value) emails.push(value);
+  }
+  return [name || 'Contact', org, ...phones.map((p) => `☎ ${p}`), ...emails.map((e) => `✉ ${e}`)]
+    .filter(Boolean)
+    .join('\n');
+}
+
+export type PollContent = proto.Message.IPollCreationMessage;
+export function pollOf(raw: WAMessage): PollContent | undefined {
+  const content = normalizeMessageContent(raw.message);
+  return (
+    content?.pollCreationMessage ||
+    content?.pollCreationMessageV2 ||
+    content?.pollCreationMessageV3 ||
+    undefined
+  );
+}
+// WhatsApp uses 0 for "any number of options"; missing means single choice.
+export function pollLimit(poll: PollContent): number {
+  return poll.selectableOptionsCount ?? 1;
+}
+// Received and local votes, with 'me' marking your own selection.
+export function pollTally(raw: WAMessage): { name: string; voters: string[] }[] {
+  try {
+    return getAggregateVotesInPollMessage(
+      { message: normalizeMessageContent(raw.message), pollUpdates: raw.pollUpdates || [] },
+      'me',
+    );
+  } catch {
+    return (pollOf(raw)?.options || []).map((o) => ({ name: o.optionName || '', voters: [] }));
+  }
+}
+function pollText(raw: WAMessage, poll: PollContent): string {
+  const tally = pollTally(raw);
+  const votes = tally.some((o) => o.voters.length);
+  const limit = pollLimit(poll);
+  const choice = limit === 1 ? '' : limit ? `\nSelect up to ${limit}` : '\nSelect any number';
+  return `${poll.name}\n${(poll.options || [])
+    .map((o, i) => {
+      const voters = tally.find((t) => t.name === (o.optionName || ''))?.voters || [];
+      const count = votes ? ` · ${voters.length}` : '';
+      return `${i + 1}. ${o.optionName}${count}${voters.includes('me') ? ' ✓' : ''}`;
+    })
+    .join('\n')}${choice}`;
+}
+
+export function contextOf(raw: WAMessage): proto.IContextInfo | undefined {
+  const content = normalizeMessageContent(raw.message);
+  if (!content) return;
+  for (const value of Object.values(content))
+    if (value && typeof value === 'object' && 'contextInfo' in value && value.contextInfo)
+      return value.contextInfo as proto.IContextInfo;
+}
+export function mentionsOf(raw: WAMessage): string[] {
+  return (contextOf(raw)?.mentionedJid || []).filter(Boolean);
+}
+// The quoted message as the sender's client embedded it in the reply.
+export function quotedOf(m: Message): Message | undefined {
+  const context = contextOf(m.raw);
+  if (!context?.stanzaId || !context.quotedMessage) return;
+  return normalize({
+    key: {
+      remoteJid: m.jid,
+      id: context.stanzaId,
+      participant: context.participant || undefined,
+      fromMe: false,
+    },
+    message: context.quotedMessage,
+    messageTimestamp: m.timestamp,
+  });
+}
 
 export function statusOf(status?: number | null): ReceiptStatus {
   switch (status) {
@@ -118,10 +223,10 @@ export function normalize(raw: WAMessage, includeBackground = false): Message | 
     kind = 'contact';
     const c = content.contactMessage;
     text = c
-      ? `${c.displayName || 'Contact'}\n${c.vcard || ''}`
+      ? vcardText(c.displayName, c.vcard)
       : (content.contactsArrayMessage?.contacts || [])
-          .map((c) => `${c.displayName || ''}\n${c.vcard || ''}`)
-          .join('\n');
+          .map((c) => vcardText(c.displayName, c.vcard))
+          .join('\n\n');
   } else if (content.locationMessage || content.liveLocationMessage) {
     kind = 'location';
     const l = content.locationMessage || content.liveLocationMessage!;
@@ -132,15 +237,13 @@ export function normalize(raw: WAMessage, includeBackground = false): Message | 
     content.pollCreationMessageV3
   ) {
     kind = 'poll';
-    const p =
-      content.pollCreationMessage ||
-      content.pollCreationMessageV2 ||
-      content.pollCreationMessageV3!;
-    text = `${p.name}\n${(p.options || []).map((o, i) => `${i + 1}. ${o.optionName}`).join('\n')}`;
+    text = pollText(raw, pollOf(raw)!);
   } else if (
     content.reactionMessage ||
     content.protocolMessage ||
-    content.senderKeyDistributionMessage
+    content.senderKeyDistributionMessage ||
+    // Encrypted votes are applied to their poll; they are not chat messages.
+    content.pollUpdateMessage
   )
     return;
   else {

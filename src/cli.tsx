@@ -1,4 +1,4 @@
-#!/usr/bin/env -S node --max-semi-space-size=1 --optimize-for-size
+#!/usr/bin/env -S node --max-semi-space-size=1 --optimize-for-size --disable-warning=ExperimentalWarning
 import React from 'react';
 import { render } from 'ink';
 import { Command } from 'commander';
@@ -15,6 +15,9 @@ import type { Client } from './types.js';
 import { archiveAccount, finishAccountReset } from './accounts.js';
 import { silenceBackgroundConsole } from './ui/console.js';
 import { Starting } from './ui/Starting.js';
+import { FOCUS_REPORTING_OFF, FOCUS_REPORTING_ON } from './ui/input.js';
+import { detectGraphics } from './kitty.js';
+import { clearMediaCache, formatBytes, mediaCacheUsage } from './media.js';
 
 const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
 const program = new Command()
@@ -40,6 +43,26 @@ program
       `chirp ${pkg.version}\nNode ${process.versions.node}\nPlatform ${process.platform} ${process.arch}\nInteractive terminal: ${process.stdin.isTTY && process.stdout.isTTY ? 'yes' : 'no'}\nProfile: ${dir}\nCached chats: ${store.stats().chats}\nCached messages: ${store.stats().messages}\nBackend: Baileys ${pkg.dependencies['@whiskeysockets/baileys']}\nUse chirp --demo to check the TUI without linking your account.`,
     );
     store.close();
+  });
+program
+  .command('cache')
+  .description('Show the size of downloaded media, or clear it with --clear')
+  .option('--clear', 'delete downloaded media (attachments download again when opened)')
+  .action(async (options) => {
+    const parent = program.opts();
+    const dir = profileDir(parent.dataDir, parent.profile);
+    if (!options.clear) {
+      const usage = await mediaCacheUsage(dir);
+      console.log(`${usage.files} cached media files · ${formatBytes(usage.bytes)} in ${dir}`);
+      return;
+    }
+    const release = await lockfile.lock(dir, { realpath: false, stale: 30_000 });
+    try {
+      const cleared = await clearMediaCache(dir);
+      console.log(`Cleared ${cleared.files} files (${formatBytes(cleared.bytes)}).`);
+    } finally {
+      await release();
+    }
   });
 program
   .command('logout')
@@ -98,7 +121,8 @@ program.action(async (options) => {
       },
     });
     restoreConsole = silenceBackgroundConsole();
-    process.stdout.write('\x1b[?1049h\x1b[?25l');
+    // Focus reports let automatic read receipts pause while the terminal is in the background.
+    process.stdout.write(`\x1b[?1049h\x1b[?25l${FOCUS_REPORTING_ON}`);
     alternate = true;
     instance = render(
       <Starting
@@ -142,6 +166,7 @@ program.action(async (options) => {
         demo={options.demo}
         settings={loadSettings(dir)}
         initialJid={demo?.DEMO_JID}
+        graphics={detectGraphics()}
       />,
     );
     const shutdown = () => instance?.unmount();
@@ -154,7 +179,7 @@ program.action(async (options) => {
   } finally {
     try {
       instance?.unmount();
-      if (alternate) process.stdout.write('\x1b[?25h\x1b[?1049l');
+      if (alternate) process.stdout.write(`${FOCUS_REPORTING_OFF}\x1b[?25h\x1b[?1049l`);
       await client?.stop();
       store?.close();
       await release?.();

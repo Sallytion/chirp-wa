@@ -4,11 +4,38 @@ import { mkdirSync, readFileSync, writeFileSync, renameSync, chmodSync } from 'n
 import type { Settings } from './types.js';
 
 // Strip terminal escape/control sequences from untrusted WhatsApp content.
+// Bidi embeddings, overrides and isolates are removed too: they can reorder
+// names and filenames on screen (for example to disguise an executable).
 export function safeText(value: unknown): string {
   return String(value ?? '')
     .replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, '')
     .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '')
-    .replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, '');
+    .replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f‪-‮⁦-⁩]/g, '');
+}
+// Web links in message text. Trailing punctuation belongs to the sentence.
+export function linksIn(text: string): string[] {
+  const links = (text.match(/\bhttps?:\/\/[^\s<>"'`]+/gi) || []).map((link) =>
+    link.replace(/[).,;:!?\]}]+$/, ''),
+  );
+  return [...new Set(links)].filter((link) => {
+    try {
+      return ['http:', 'https:'].includes(new URL(link).protocol);
+    } catch {
+      return false;
+    }
+  });
+}
+// Extensions that run code when opened with the system's default handler.
+const executable = new Set(
+  (
+    'exe msi msp com scr pif cpl bat cmd ps1 psm1 psd1 vbs vbe js jse wsf wsh hta ' +
+    'lnk url scf reg inf msc gadget jar appref-ms application sh bash zsh csh ksh ' +
+    'command tool app pkg dmg run deb rpm appimage py pyw pl rb php'
+  ).split(' '),
+);
+export function isExecutableFile(path: string): boolean {
+  const extension = /\.([^.\\/]+)$/.exec(path)?.[1]?.toLowerCase();
+  return !!extension && executable.has(extension);
 }
 export function jidFor(value: string): string {
   if (/^[\d-]+@(?:s\.whatsapp\.net|g\.us|lid)$/.test(value)) return value;
@@ -30,7 +57,8 @@ export function tokens(input: string): string[] {
       if (c === quote) quote = '';
       else token += c;
       started = true;
-    } else if (c === '"' || c === "'") {
+    } else if ((c === '"' || c === "'") && !started) {
+      // Quotes only open at a token start, so apostrophes in words stay literal.
       quote = c;
       started = true;
     } else if (/\s/.test(c)) {
@@ -71,7 +99,13 @@ export function profileDir(root: string | undefined, profile: string) {
   return privateDir(join(dataRoot, 'chirp', profile));
 }
 export function loadSettings(dir: string): Settings {
-  const defaults: Settings = { autoRead: true, notifications: false, theme: 'dark' };
+  const defaults: Settings = {
+    autoRead: true,
+    notifications: false,
+    theme: 'dark',
+    typing: true,
+    images: 'auto',
+  };
   try {
     const v = JSON.parse(readFileSync(join(dir, 'settings.json'), 'utf8'));
     return {
@@ -79,6 +113,8 @@ export function loadSettings(dir: string): Settings {
       notifications:
         typeof v.notifications === 'boolean' ? v.notifications : defaults.notifications,
       theme: v.theme === 'light' ? 'light' : 'dark',
+      typing: typeof v.typing === 'boolean' ? v.typing : defaults.typing,
+      images: ['kitty', 'blocks'].includes(v.images) ? v.images : defaults.images,
     };
   } catch {
     return defaults;

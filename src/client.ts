@@ -5,24 +5,34 @@ import makeWASocket, {
   makeCacheableSignalKeyStore,
   downloadMediaMessage,
   normalizeMessageContent,
+  decryptPollVote,
+  generateWAMessageFromContent,
+  jidNormalizedUser,
+  aesEncryptGCM,
+  hmacSign,
+  proto,
 } from '@whiskeysockets/baileys';
 import type {
   WASocket,
   BaileysEventMap,
   GroupMetadata,
   AnyMessageContent,
+  WAMessage,
+  WAMessageKey,
 } from '@whiskeysockets/baileys';
 import { EventEmitter } from 'node:events';
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { existsSync, readdirSync } from 'node:fs';
-import { writeFile, stat, chmod, rename } from 'node:fs/promises';
-import { basename, join, resolve } from 'node:path';
+import { stat, chmod, rename } from 'node:fs/promises';
+import { basename, extname, join, resolve } from 'node:path';
 import mime from 'mime-types';
 import pino from 'pino';
-import type { Client, ClientState, Message, SyncPhase } from './types.js';
+import type { Client, ClientState, Message, Participant, SyncPhase } from './types.js';
+import { isMuted } from './types.js';
 import { Store } from './store.js';
-import { numeric } from './messages.js';
-import { errorText, jidFor, privateDir } from './util.js';
+import { numeric, pollLimit, pollOf } from './messages.js';
+import { errorText, jidFor, privateDir, safeText } from './util.js';
+import { MAX_MEDIA_BYTES, saveDownload } from './media.js';
 import { protocolVersion } from './version.js';
 import { isChannel } from './conversations.js';
 import { fetchContactSnapshot } from './contacts.js';
@@ -289,7 +299,11 @@ export class WhatsAppClient implements Client {
         this.store.transaction(() => {
           for (const chat of event.chats)
             if (chat.id) this.store.upsertWAChat({ ...chat, id: chat.id });
-          for (const message of event.messages) this.store.ingest(message);
+          // Polls must be stored before the votes that refer to them.
+          const votes = event.messages.filter(isPollVote);
+          for (const message of event.messages)
+            if (!isPollVote(message)) this.store.ingest(message);
+          for (const vote of votes) this.applyPollVote(vote);
         });
         this.update({
           historyProgress: event.progress ?? undefined,
@@ -329,16 +343,19 @@ export class WhatsAppClient implements Client {
         let incoming = false;
         this.store.transaction(() => {
           for (const m of event.messages) {
+            if (isPollVote(m)) {
+              this.applyPollVote(m);
+              continue;
+            }
             const fresh = this.store.ingest(m, event.type === 'notify');
             if (
               fresh &&
               event.type === 'notify' &&
               !m.key.fromMe &&
-              m.key.remoteJid !== 'status@broadcast'
-            ) {
-              const muted = this.store.chat(m.key.remoteJid || '')?.muted || 0;
-              if (muted < Date.now() / 1000) incoming = true;
-            }
+              m.key.remoteJid !== 'status@broadcast' &&
+              !isMuted(this.store.chat(m.key.remoteJid || ''))
+            )
+              incoming = true;
           }
         });
         if (incoming && this.bell?.()) process.stdout.write('\x07');
@@ -558,8 +575,7 @@ export class WhatsAppClient implements Client {
     const file = resolve(path);
     const info = await stat(file);
     if (!info.isFile()) throw new Error('Attachment must be a file.');
-    if (info.size > 100 * 1024 * 1024)
-      throw new Error('Attachments are limited to 100 MB in chirp.');
+    if (info.size > MAX_MEDIA_BYTES) throw new Error('Attachments are limited to 100 MB in chirp.');
     const mimetype = mime.lookup(file) || 'application/octet-stream';
     let content: AnyMessageContent;
     if (mimetype.startsWith('image/') && mimetype !== 'image/gif')
@@ -601,6 +617,10 @@ export class WhatsAppClient implements Client {
     const socket = this.online();
     if (!active) await socket.presenceSubscribe(jid);
     await socket.sendPresenceUpdate(active ? 'composing' : 'paused', jid);
+  }
+  async watchPresence(jid: string) {
+    if (isChannel(jid) || this.state.connection !== 'open' || !this.socket) return;
+    await this.socket.presenceSubscribe(jid);
   }
   async history(jid: string, oldest?: Message) {
     if (isChannel(jid))
@@ -663,29 +683,25 @@ export class WhatsAppClient implements Client {
       content?.audioMessage ||
       content?.documentMessage ||
       content?.stickerMessage;
-    if (Number(media?.fileLength || 0) > 100 * 1024 * 1024)
+    if (Number(media?.fileLength || 0) > MAX_MEDIA_BYTES)
       throw new Error('Media downloads are limited to 100 MB in chirp.');
     const cache = privateDir(join(this.dir, 'media'));
-    const extension =
-      mime.extension(message.mimetype || '') ||
-      ({ image: 'jpg', video: 'mp4', audio: 'ogg', sticker: 'webp' } as Record<string, string>)[
-        message.kind
-      ] ||
-      'bin';
     const hash = createHash('sha256')
       .update(`${message.jid}:${message.id}:${message.fromMe}`)
       .digest('hex')
       .slice(0, 32);
-    const file = join(cache, `${hash}.${extension}`);
+    const file = join(cache, `${hash}.${mediaExtension(message)}`);
     if (existsSync(file)) return file;
     const socket = this.online();
-    const buffer = await downloadMediaMessage(
+    // Stream to disk: the declared size can be absent, so the limit is enforced
+    // on the bytes actually received.
+    const stream = await downloadMediaMessage(
       message.raw,
-      'buffer',
+      'stream',
       {},
       { logger: this.logger, reuploadRequest: socket.updateMediaMessage },
     );
-    await writeFile(file, buffer, { mode: 0o600 });
+    await saveDownload(file, stream);
     return file;
   }
   async react(message: Message, emoji: string) {
@@ -717,7 +733,7 @@ export class WhatsAppClient implements Client {
     const result = await this.online().sendMessage(jid, { forward: message.raw });
     if (result) this.store.ingest(result);
   }
-  async modifyChat(jid: string, action: 'archive' | 'pin' | 'mute' | 'unread', value: boolean) {
+  async modifyChat(jid: string, action: 'archive' | 'pin' | 'unread', value: boolean) {
     this.conversation(jid);
     const lastMessages = this.store
       .history(jid, 10)
@@ -728,9 +744,7 @@ export class WhatsAppClient implements Client {
         ? { archive: value, lastMessages }
         : action === 'pin'
           ? { pin: value }
-          : action === 'mute'
-            ? { mute: value ? -1 : null }
-            : { markRead: !value, lastMessages };
+          : { markRead: !value, lastMessages };
     await this.online().chatModify(patch, jid);
     this.store.upsertChat({
       jid,
@@ -738,10 +752,19 @@ export class WhatsAppClient implements Client {
         ? { archived: value }
         : action === 'pin'
           ? { pinned: value ? Math.floor(Date.now() / 1000) : 0 }
-          : action === 'mute'
-            ? { muted: value ? Number.MAX_SAFE_INTEGER : 0 }
-            : { unread: value ? 1 : 0 }),
+          : { unread: value ? 1 : 0 }),
     });
+  }
+  async mute(jid: string, seconds: number | null) {
+    this.conversation(jid);
+    const until =
+      seconds == null ? 0 : seconds < 0 ? -1 : Math.floor(Date.now() / 1000) + Math.floor(seconds);
+    // WhatsApp stores the mute end as a millisecond timestamp; -1 means always.
+    await this.online().chatModify(
+      { mute: until === 0 ? null : until < 0 ? -1 : until * 1000 },
+      jid,
+    );
+    this.store.upsertChat({ jid, muted: until });
   }
   async group(jid: string, action: string, args: string[]) {
     const socket = this.online();
@@ -799,6 +822,161 @@ export class WhatsAppClient implements Client {
     });
     if (result) this.store.ingest(result);
   }
+  async participants(jid: string): Promise<Participant[]> {
+    if (!jid.endsWith('@g.us')) return [];
+    let group = this.groups.get(jid);
+    if (!group) {
+      if (this.state.connection !== 'open' || !this.socket) return [];
+      group = await this.socket.groupMetadata(jid);
+      this.groups.set(jid, group);
+    }
+    const me = this.ownIds();
+    return group.participants
+      .filter((p) => !me.includes(jidNormalizedUser(p.id)))
+      .map((p) => ({
+        jid: p.id,
+        name: safeText(
+          this.store.contactName(p.id) ||
+            (p.phoneNumber && this.store.contactName(p.phoneNumber)) ||
+            p.notify ||
+            p.name ||
+            p.id.split('@')[0],
+        ),
+      }));
+  }
+  async vote(message: Message, options: number[]) {
+    this.conversation(message.jid);
+    const poll = pollOf(message.raw);
+    if (message.kind !== 'poll' || !poll) throw new Error('Select a poll to vote.');
+    const names = (poll.options || []).map((o) => o.optionName || '');
+    const chosen = [...new Set(options)];
+    if (chosen.some((i) => !Number.isInteger(i) || i < 0 || i >= names.length))
+      throw new Error(`Choose options between 1 and ${names.length}.`);
+    const limit = pollLimit(poll);
+    if (limit && chosen.length > limit)
+      throw new Error(
+        limit === 1 ? 'This poll allows one choice.' : `This poll allows up to ${limit} choices.`,
+      );
+    const secret = pollSecret(message.raw);
+    if (!secret) throw new Error('This poll has no encryption key here. Vote on your phone.');
+    const socket = this.online();
+    const [creator, voter] = this.voteIdentity(message);
+    const pollMsgId = message.raw.key.id!;
+    const selectedOptions = chosen.map((i) => createHash('sha256').update(names[i]).digest());
+    // Inverse of Baileys' decryptPollVote: HMAC-derived AES-256-GCM key.
+    const key = hmacSign(
+      Buffer.concat([
+        Buffer.from(pollMsgId),
+        Buffer.from(creator),
+        Buffer.from(voter),
+        Buffer.from('Poll Vote'),
+        new Uint8Array([1]),
+      ]),
+      hmacSign(secret, new Uint8Array(32)),
+    );
+    const encIv = randomBytes(12);
+    const encPayload = aesEncryptGCM(
+      proto.Message.PollVoteMessage.encode({ selectedOptions }).finish(),
+      key,
+      encIv,
+      Buffer.from(`${pollMsgId}\u0000${voter}`),
+    );
+    const jid = message.raw.key.remoteJid || message.jid;
+    const senderTimestampMs = Date.now();
+    const update = generateWAMessageFromContent(
+      jid,
+      {
+        pollUpdateMessage: {
+          pollCreationMessageKey: {
+            remoteJid: jid,
+            fromMe: !!message.raw.key.fromMe,
+            id: pollMsgId,
+            ...(message.raw.key.participant ? { participant: message.raw.key.participant } : {}),
+          },
+          vote: { encPayload, encIv },
+          senderTimestampMs,
+        },
+      },
+      { userJid: voter },
+    );
+    await socket.relayMessage(jid, update.message!, { messageId: update.key.id! });
+    this.store.updateRaw(message.raw.key, {
+      pollUpdates: [
+        {
+          pollUpdateMessageKey: { ...update.key, fromMe: true },
+          vote: { selectedOptions },
+          senderTimestampMs,
+        },
+      ],
+    });
+  }
+  private ownIds(): string[] {
+    const me = this.socket?.authState?.creds.me;
+    return [me?.id, me?.lid].filter((id): id is string => !!id).map((id) => jidNormalizedUser(id));
+  }
+  // Votes are bound to the creator and voter addresses. Use the poll's own
+  // addressing: LID polls (and LID-addressed groups) vote with your LID.
+  private voteIdentity(m: Message): [string, string] {
+    const me = this.socket?.authState?.creds.me;
+    const key = m.raw.key;
+    const author = key.fromMe ? undefined : key.participant || key.remoteJid || undefined;
+    const lid = author
+      ? author.endsWith('@lid')
+      : this.groups.get(m.jid)?.addressingMode === 'lid' || m.jid.endsWith('@lid');
+    const mine = (lid && me?.lid) || me?.id;
+    if (!mine) throw new Error('Link WhatsApp before voting.');
+    return [jidNormalizedUser(author || mine), jidNormalizedUser(mine)];
+  }
+  // Every address a key's author may have used: phone numbers, LIDs and aliases.
+  private authors(key: WAMessageKey): string[] {
+    const ids = key.fromMe
+      ? this.ownIds()
+      : [
+          key.participant,
+          key.participantAlt,
+          ...(key.participant ? [] : [key.remoteJid, key.remoteJidAlt]),
+        ];
+    const normalized = ids.filter((id): id is string => !!id).map((id) => jidNormalizedUser(id));
+    return [
+      ...new Set(
+        normalized.flatMap((id) => [id, this.store.resolve(id), ...this.store.aliasesOf(id)]),
+      ),
+    ];
+  }
+  // Baileys does not decrypt poll votes; apply them to the stored poll here.
+  private applyPollVote(raw: WAMessage) {
+    const update = normalizeMessageContent(raw.message)?.pollUpdateMessage;
+    const creation = update?.pollCreationMessageKey;
+    if (!update?.vote || !creation?.id) return;
+    const pollKey = { ...creation, remoteJid: creation.remoteJid || raw.key.remoteJid };
+    const poll = this.store.message(pollKey);
+    const secret = poll && pollSecret(poll.raw);
+    if (!poll || !secret) return;
+    for (const pollCreatorJid of this.authors(poll.raw.key))
+      for (const voterJid of this.authors(raw.key)) {
+        try {
+          const vote = decryptPollVote(update.vote, {
+            pollCreatorJid,
+            pollMsgId: creation.id,
+            pollEncKey: secret,
+            voterJid,
+          });
+          this.store.updateRaw(poll.raw.key, {
+            pollUpdates: [
+              {
+                pollUpdateMessageKey: raw.key,
+                vote,
+                senderTimestampMs: longNumber(update.senderTimestampMs),
+              },
+            ],
+          });
+          return;
+        } catch {
+          // Authentication fails for the wrong address pair; try the next one.
+        }
+      }
+    this.logger.error({ event: 'poll-vote', id: creation.id }, 'Could not decrypt a poll vote');
+  }
   async logout() {
     const socket = this.online();
     this.loggingOut = true;
@@ -850,4 +1028,35 @@ export class WhatsAppClient implements Client {
       this.loggingOut = false;
     }
   }
+}
+
+function isPollVote(raw: WAMessage): boolean {
+  return !!normalizeMessageContent(raw.message)?.pollUpdateMessage;
+}
+function pollSecret(raw: WAMessage): Uint8Array | undefined {
+  return (
+    raw.message?.messageContextInfo?.messageSecret ||
+    normalizeMessageContent(raw.message)?.messageContextInfo?.messageSecret ||
+    undefined
+  );
+}
+function longNumber(value: unknown): number {
+  if (value && typeof value === 'object' && 'toNumber' in value)
+    return (value as { toNumber(): number }).toNumber();
+  return numeric(value);
+}
+// Prefer the declared type; fall back to the sender's filename extension.
+// isExecutableFile() guards opening whatever extension results.
+function mediaExtension(message: Message): string {
+  const declared = mime.extension(message.mimetype || '');
+  if (declared) return declared;
+  const named = extname(message.filename || '')
+    .slice(1)
+    .toLowerCase();
+  if (/^[a-z0-9]{1,8}$/.test(named)) return named;
+  return (
+    ({ image: 'jpg', video: 'mp4', audio: 'ogg', sticker: 'webp' } as Record<string, string>)[
+      message.kind
+    ] || 'bin'
+  );
 }

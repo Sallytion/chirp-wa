@@ -20,11 +20,23 @@ export interface Line {
   day?: boolean;
   header?: boolean;
 }
+export interface TranscriptOptions {
+  senderName?: (message: Message) => string;
+  // The replied-to message's sender and a one-line preview of its text.
+  quote?: (message: Message) => { sender: string; text: string } | undefined;
+  // Display text, e.g. with @number mentions replaced by contact names.
+  text?: (message: Message) => string;
+}
 export function transcript(
   messages: Message[],
   width: number,
-  senderName?: (message: Message) => string,
+  options: TranscriptOptions | TranscriptOptions['senderName'] = {},
 ): Line[] {
+  const {
+    senderName,
+    quote,
+    text: display,
+  } = typeof options === 'function' ? { senderName: options } : options;
   const lines: Line[] = [];
   let day = '';
   for (const m of messages) {
@@ -47,13 +59,24 @@ export function transcript(
     const block: Line[] = [];
     const header = `${m.fromMe ? 'You' : senderName?.(m) || m.sender.split('@')[0]}  ${time}${m.fromMe ? `  ${receiptLabel[m.status]}` : ''}${m.edited ? '  edited' : ''}${m.starred ? '  ★' : ''}`;
     block.push({ text: fit(header, maxWidth - 2), message: m, meta: true, header: true });
-    if (m.quotedId)
-      block.push({ text: `↳ Reply to ${m.quotedId.slice(-10)}`, message: m, meta: true });
+    if (m.quotedId) {
+      const quoted = quote?.(m);
+      block.push({
+        text: fit(
+          quoted
+            ? `↳ ${quoted.sender}: ${quoted.text.replace(/\s+/g, ' ')}`
+            : '↳ Reply to an earlier message',
+          maxWidth - 2,
+        ),
+        message: m,
+        meta: true,
+      });
+    }
     const media =
       m.kind !== 'text'
         ? `${({ image: '▧ Image', video: '▷ Video', audio: '♫ Audio', document: '▤ File', sticker: '◇ Sticker', contact: '♙ Contact', location: '⌖ Location', poll: '▥ Poll' } as Record<string, string>)[m.kind]}${m.viewOnce ? ' · view once' : ['image', 'sticker', 'video', 'audio', 'document'].includes(m.kind) ? ' · Ctrl+P preview' : ''}\n`
         : '';
-    const text = m.deleted ? 'This message was deleted' : media + (m.text || '');
+    const text = m.deleted ? 'This message was deleted' : media + ((display?.(m) ?? m.text) || '');
     for (const textLine of wrapAnsi(text, Math.max(10, maxWidth - 2), {
       hard: true,
       trim: false,

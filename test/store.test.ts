@@ -341,7 +341,7 @@ test('legacy database upgrade recovers aliased contact names and incoming sender
     assert.equal(store.name('123@g.us'), '123');
     assert.equal(store.resolve('777@lid'), '888@s.whatsapp.net');
     assert.equal(store.count('888@s.whatsapp.net'), 1);
-    assert.equal(store.db.prepare('PRAGMA user_version').get()?.user_version, 4);
+    assert.equal(store.db.prepare('PRAGMA user_version').get()?.user_version, 5);
   } finally {
     store.close();
     rmSync(dir, { recursive: true, force: true });

@@ -1,16 +1,28 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Box, Text, useApp, useStdout } from 'ink';
 import QRCode from 'qrcode';
-import { readFile, stat } from 'node:fs/promises';
+import { rmSync } from 'node:fs';
+import { readFile, rm, stat } from 'node:fs/promises';
+import { basename, dirname, resolve } from 'node:path';
 import open from 'open';
 import wrapAnsi from 'wrap-ansi';
-import type { Client, Message, Settings } from '../types.js';
+import type { Client, Message, Participant, Settings } from '../types.js';
+import { isMuted } from '../types.js';
 import { Store } from '../store.js';
-import { command, HELP, type CommandResult } from '../commands.js';
-import { imagePreview } from '../media.js';
-import { errorText, jidFor, safeText, saveSettings } from '../util.js';
+import { command, HELP, type CommandContext, type CommandResult } from '../commands.js';
+import { imagePreview, openExternally } from '../media.js';
+import { errorText, jidFor, linksIn, safeText, saveSettings } from '../util.js';
+import { mentionsOf, pollLimit, pollOf, quotedOf } from '../messages.js';
+import {
+  displayMentions,
+  insertMention,
+  mentionToken,
+  mentionsIn,
+  searchParticipants,
+} from '../mentions.js';
+import { kittyPreview, type Graphics, type KittyImage } from '../kitty.js';
 import { Composer, composerLines } from './Composer.js';
-import { EmojiSuggestions } from './EmojiSuggestions.js';
+import { Suggestions, type Suggestion } from './Suggestions.js';
 import { emojiToken, insertEmoji, searchEmoji } from '../emoji.js';
 import {
   deleteAtCursor,
@@ -33,7 +45,8 @@ interface Modal {
   type: 'info' | 'chats' | 'search' | 'menu' | 'prompt' | 'preview';
   title: string;
   text?: string;
-  query?: string;
+  // Search within this conversation only.
+  scope?: string;
   results?: Message[];
   items?: MenuItem[];
   submit?: (text: string) => void | Promise<void>;
@@ -50,7 +63,21 @@ export interface AppProps {
   demo?: boolean;
   initialJid?: string;
   clipboard?: (dir: string) => Promise<ClipboardContent>;
+  // Image previews when the setting is "auto" (detected from the terminal).
+  graphics?: Graphics;
 }
+
+interface Picker {
+  title: string;
+  key: string;
+  items: Suggestion[];
+  index: number;
+  insert(index: number): { value: string; cursor: number };
+}
+const SEARCH_PAGE = 50;
+// Pinned and muted markers before a sidebar chat name.
+const chatIcons = (chat: { pinned: number; muted: number }) =>
+  `${chat.pinned ? '◆ ' : ''}${isMuted(chat) ? '⊘ ' : ''}`;
 
 export function App({
   store,
@@ -61,6 +88,7 @@ export function App({
   demo,
   initialJid,
   clipboard = readClipboard,
+  graphics = 'blocks',
 }: AppProps) {
   const { exit } = useApp();
   const { stdout } = useStdout();
@@ -84,10 +112,10 @@ export function App({
   const [value, setValueState] = useState(() => (jid ? store.draft(jid) : ''));
   const [cursor, setCursorState] = useState(Array.from(value).length);
   const editorRef = useRef({ value, cursor });
-  const emojiRef = useRef({ key: '', index: 0, dismissed: '' });
-  const [, refreshEmoji] = useState(0);
+  const suggestRef = useRef({ key: '', index: 0, dismissed: '' });
+  const [, refreshSuggestions] = useState(0);
   function setValue(next: string) {
-    emojiRef.current.dismissed = '';
+    suggestRef.current.dismissed = '';
     editorRef.current.value = next;
     setValueState(next);
   }
@@ -97,13 +125,43 @@ export function App({
     setCursorState(number);
   }
   const [reply, setReply] = useState<Message>();
-  const [imageDrafts, setImageDrafts] = useState<Record<string, ClipboardImage>>({});
+  const [imageDrafts, setImageDraftState] = useState<Record<string, ClipboardImage>>({});
+  const imageDraftsRef = useRef(imageDrafts);
+  // Pasted images are temporary files; delete them once sent or discarded.
+  // Only Chirp's own clipboard files are removed, never other paths.
+  const temporary = (path: string) =>
+    basename(path).startsWith('clipboard-') && resolve(dirname(path)) === resolve(dir, 'media');
+  function setImageDrafts(
+    update: (previous: Record<string, ClipboardImage>) => typeof imageDrafts,
+  ) {
+    const next = update(imageDraftsRef.current);
+    const kept = new Set(Object.values(next).map((image) => image.path));
+    for (const image of Object.values(imageDraftsRef.current))
+      if (!kept.has(image.path) && temporary(image.path))
+        void rm(image.path, { force: true }).catch(() => {});
+    imageDraftsRef.current = next;
+    setImageDraftState(next);
+  }
   const clipboardPending = useRef(false);
   const pastedImage = jid ? imageDrafts[jid] : undefined;
-  const [notice, setNotice] = useState('');
+  // Local and client notices share one status line; the most recent one wins.
+  const noticeOrder = useRef(0);
+  const clientNotice = useRef({ text: client.state.notice, order: 0 });
+  const [localNotice, setLocalNotice] = useState({ text: '', order: 0 });
+  const setNotice = (text: string) => setLocalNotice({ text, order: ++noticeOrder.current });
+  const notice =
+    localNotice.text && localNotice.order > clientNotice.current.order
+      ? localNotice.text
+      : client.state.notice;
+  const [terminalFocused, setTerminalFocused] = useState(true);
+  const [participants, setParticipants] = useState<Participant[]>([]);
+  const [searchPages, setSearchPages] = useState(1);
+  const kittyRef = useRef<KittyImage | undefined>(undefined);
   const [busy, setBusy] = useState(false);
   const busyRef = useRef(false);
   const [modal, setModal] = useState<Modal>();
+  const modalRef = useRef(modal);
+  modalRef.current = modal;
   const [modalInput, setModalInput] = useState('');
   const [modalIndex, setModalIndex] = useState(0);
   const [modalScroll, setModalScroll] = useState(0);
@@ -123,20 +181,40 @@ export function App({
   const loginVisible =
     !demo && (state.connection === 'qr' || state.connection === 'logged-out' || login);
   const syncVisible = !!state.sync && !loginVisible;
-  function emojiPicker(text: string, position: number) {
+  // Composer completions: @mentions in groups, otherwise :emoji: shortcodes.
+  function suggestionPicker(text: string, position: number): Picker | undefined {
     if (focus !== 'composer' || section === 'channels' || modal || loginVisible) return;
+    const choose = (key: string, length: number) =>
+      key === suggestRef.current.key ? Math.min(suggestRef.current.index, length - 1) : 0;
+    const mention = jid?.endsWith('@g.us') ? mentionToken(text, position) : undefined;
+    if (mention) {
+      if (mention.key === suggestRef.current.dismissed) return;
+      const people = searchParticipants(participants, mention.query);
+      if (!people.length) return;
+      return {
+        title: 'Mention',
+        key: mention.key,
+        items: people.map((p) => ({ key: p.jid, label: `${p.name} · ${p.jid.split('@')[0]}` })),
+        index: choose(mention.key, people.length),
+        insert: (i) => insertMention(text, mention, people[i]),
+      };
+    }
     const token = emojiToken(text, position);
-    if (!token || token.key === emojiRef.current.dismissed) return;
-    const items = searchEmoji(token.query);
-    if (!items.length) return;
+    if (!token || token.key === suggestRef.current.dismissed) return;
+    const emoji = searchEmoji(token.query);
+    if (!emoji.length) return;
     return {
-      token,
-      items,
-      index:
-        token.key === emojiRef.current.key ? Math.min(emojiRef.current.index, items.length - 1) : 0,
+      title: 'Emoji',
+      key: token.key,
+      items: emoji.map((e) => ({
+        key: e.emoji,
+        label: `${e.emoji}  :${e.shortcode}:  ${e.label}`,
+      })),
+      index: choose(token.key, emoji.length),
+      insert: (i) => insertEmoji(text, token, emoji[i].emoji),
     };
   }
-  const picker = emojiPicker(value, cursor);
+  const picker = suggestionPicker(value, cursor);
   const emojiRows = Math.min(4, Math.max(1, rows - 18));
   const pickerHeight = picker ? Math.min(emojiRows, picker.items.length) + 1 : 0;
   const composerExtra =
@@ -162,9 +240,60 @@ export function App({
   );
   const selected = messages.find((m) => m.id === selectedId) || messages.at(-1);
   const transcriptLines = useMemo(
-    () => transcript(messages, contentWidth - 6, (m) => store.senderName(m)),
+    () =>
+      transcript(messages, contentWidth - 6, {
+        senderName: (m) => store.senderName(m),
+        // Prefer the cached original (it reflects edits and deletions), then
+        // the copy the sender's client embedded in the reply.
+        quote: (m) => {
+          const original = m.quotedId
+            ? store.message({ remoteJid: m.jid, id: m.quotedId })
+            : undefined;
+          const quoted = original || quotedOf(m);
+          if (!quoted) return;
+          const author = quoted.raw.key.participant;
+          return {
+            sender: original
+              ? store.senderName(original)
+              : author
+                ? store.name(author)
+                : store.name(m.jid),
+            text: quoted.deleted ? 'This message was deleted' : quoted.text || `[${quoted.kind}]`,
+          };
+        },
+        text: (m) => {
+          const mentioned = mentionsOf(m.raw);
+          return mentioned.length
+            ? displayMentions(m.text, mentioned, (jid) => store.name(jid))
+            : m.text;
+        },
+      }),
     [messages, contentWidth, store, revision],
   );
+  const directory = useMemo(
+    () => (modal?.type === 'chats' ? store.directory(modalInput, section) : []),
+    [modal, modalInput, section, store, revision],
+  );
+  const searchResults = useMemo(
+    () =>
+      modal?.type !== 'search'
+        ? []
+        : modal.results ||
+          (modalInput
+            ? store.search(modalInput, modal.scope, section, searchPages * SEARCH_PAGE)
+            : []),
+    [modal, modalInput, section, searchPages, store, revision],
+  );
+  // Nearing the end of a full page of search results loads the next page.
+  useEffect(() => {
+    if (
+      modal?.type === 'search' &&
+      !modal.results &&
+      searchResults.length === searchPages * SEARCH_PAGE &&
+      modalIndex >= searchResults.length - 5
+    )
+      setSearchPages((pages) => pages + 1);
+  }, [modal, modalIndex, searchResults.length, searchPages]);
   const lines = useMemo(
     () =>
       viewport(
@@ -236,7 +365,11 @@ export function App({
   useEffect(() => {
     const update = () => setVersion((v) => v + 1);
     const a = store.subscribe(update);
-    const b = client.subscribe(update);
+    const b = client.subscribe(() => {
+      if (client.state.notice !== clientNotice.current.text)
+        clientNotice.current = { text: client.state.notice, order: ++noticeOrder.current };
+      update();
+    });
     const resize = () => setSize({ columns: stdout.columns || 120, rows: stdout.rows || 36 });
     stdout.on('resize', resize);
     return () => {
@@ -245,8 +378,34 @@ export function App({
       stdout.off('resize', resize);
       const draft = draftRef.current;
       if (draft.jid) store.saveDraft(draft.jid, draft.value);
+      // Unsent clipboard images do not survive a restart; remove their files.
+      for (const image of Object.values(imageDraftsRef.current))
+        if (temporary(image.path)) rmSync(image.path, { force: true });
+      if (kittyRef.current) stdout.write(kittyRef.current.remove);
     };
   }, [client, store, stdout]);
+  // Free a kitty image once its preview dialog closes.
+  useEffect(() => {
+    const image = kittyRef.current;
+    if (image && modal?.image !== image.text) {
+      stdout.write(image.remove);
+      kittyRef.current = undefined;
+    }
+  }, [modal, stdout]);
+  useEffect(() => {
+    setParticipants([]);
+    if (!jid?.endsWith('@g.us')) return;
+    let active = true;
+    client
+      .participants(jid)
+      .then((list) => {
+        if (active) setParticipants(list);
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
+  }, [jid, client, state.connection]);
   useEffect(() => {
     if (jid) store.saveDraft(jid, value);
   }, [jid, value, store]);
@@ -265,8 +424,10 @@ export function App({
     }
   }, [state.qr]);
   const visibleKey = visibleMessages.map((m) => `${m.id}:${m.localRead}`).join(',');
+  // Read receipts only go out while someone can see the terminal.
   useEffect(() => {
-    if (!jid || !settings.autoRead || state.connection !== 'open' || modal) return;
+    if (!jid || !settings.autoRead || !terminalFocused || state.connection !== 'open' || modal)
+      return;
     const unread = visibleMessages.filter(
       (m) =>
         !m.fromMe && !m.localRead && !m.deleted && !readPending.current.has(`${m.jid}:${m.id}`),
@@ -282,9 +443,17 @@ export function App({
         });
     }, 350);
     return () => clearTimeout(timer);
-  }, [jid, visibleKey, settings.autoRead, state.connection, !!modal]);
+  }, [jid, visibleKey, settings.autoRead, terminalFocused, state.connection, !!modal]);
+  const typingEnabled = settings.typing !== false;
+  // Opening a chat subscribes to presence; only announce "paused" when typing
+  // indicators are enabled.
+  const watchChat = (target: string) =>
+    void (typingEnabled ? client.typing(target, false) : client.watchPresence(target)).catch(
+      () => {},
+    );
   useEffect(() => {
-    if (!jid || state.connection !== 'open' || !value || value.startsWith('/')) return;
+    if (!typingEnabled || !jid || state.connection !== 'open' || !value || value.startsWith('/'))
+      return;
     const timer = setTimeout(() => {
       void client.typing(jid, true).catch(() => {});
     }, 300);
@@ -295,7 +464,7 @@ export function App({
       clearTimeout(timer);
       clearTimeout(paused);
     };
-  }, [value, jid, state.connection]);
+  }, [value, jid, state.connection, typingEnabled]);
 
   function setDraft(text: string) {
     setValue(text);
@@ -353,9 +522,8 @@ export function App({
       .findIndex((c) => c.jid === resolved);
     setChatIndex(Math.max(0, index));
     if (message) {
-      const all = store.allMessages(resolved);
-      const i = all.findIndex((m) => m.id === message.id && m.fromMe === message.fromMe);
-      setOffset(Math.max(0, all.length - i - 30));
+      // Place the message about halfway up a 60-message history page.
+      setOffset(Math.max(0, store.newerCount({ ...message, jid: resolved }) - 29));
       setSelectedId(message.id);
       setFocus('messages');
     } else {
@@ -364,13 +532,50 @@ export function App({
       setFocus(nextSection === 'channels' ? 'messages' : 'composer');
     }
     setModal(undefined);
-    void client.typing(resolved, false).catch(() => {});
+    watchChat(resolved);
   }
   function show(next: Modal) {
     setModal(next);
     setModalInput(next.initial || '');
     setModalIndex(0);
     setModalScroll(0);
+    setSearchPages(1);
+  }
+  function context(): CommandContext {
+    return {
+      store,
+      client,
+      jid,
+      selected,
+      visible: visibleMessages,
+      settings,
+      section,
+      dir,
+      keep: Object.values(imageDraftsRef.current).map((image) => image.path),
+    };
+  }
+  const imageMode =
+    settings.images === 'kitty' || settings.images === 'blocks' ? settings.images : graphics;
+  // Kitty images are transmitted out of band and drawn by placeholder text.
+  async function renderImage(path: string): Promise<{ image: string; kitty?: KittyImage }> {
+    if (imageMode !== 'kitty') return { image: await imagePreview(path, columns - 10, rows - 11) };
+    const kitty = await kittyPreview(path, columns - 10, rows - 11);
+    stdout.write(kitty.transmit);
+    return { image: kitty.text, kitty };
+  }
+  function showImage(file: string, rendered: { image: string; kitty?: KittyImage }, text = '') {
+    if (rendered.kitty) {
+      // The dialog closed while the image loaded; free the transmitted image.
+      if (modalRef.current?.file !== file) {
+        stdout.write(rendered.kitty.remove);
+        return;
+      }
+      if (kittyRef.current) stdout.write(kittyRef.current.remove);
+      kittyRef.current = rendered.kitty;
+    }
+    setModal((current) =>
+      current?.file === file ? { ...current, image: rendered.image, text } : current,
+    );
   }
   function preferences(next: Settings) {
     setSettings(next);
@@ -397,26 +602,31 @@ export function App({
       file: path,
       text: 'Loading preview…',
     });
-    let image: string | undefined;
-    let text = '';
     if (['image', 'sticker'].includes(message.kind)) {
       try {
-        image = await imagePreview(path, columns - 10, rows - 11);
+        showImage(path, await renderImage(path));
       } catch {
-        text =
-          'This image format cannot be rendered here. Press O to open it in your default viewer.';
+        showImage(
+          path,
+          { image: '' },
+          'This image format cannot be rendered here. Press O to open it in your default viewer.',
+        );
       }
     } else if (message.mimetype?.startsWith('text/') && (await stat(path)).size < 1024 * 1024)
-      text = safeText(await readFile(path, 'utf8'));
+      showImage(path, { image: '' }, safeText(await readFile(path, 'utf8')));
     else
-      text = `${message.text}\n\n${message.mimetype || message.kind}\n${path}\n\nPress O to open with your default player or viewer.`;
-    setModal((current) => (current?.file === path ? { ...current, image, text } : current));
+      showImage(
+        path,
+        { image: '' },
+        `${message.text}\n\n${message.mimetype || message.kind}\n${path}\n\nPress O to open with your default player or viewer.`,
+      );
   }
   function discardImage() {
     if (!jid) return;
+    const target = jid;
     setImageDrafts((previous) => {
       const next = { ...previous };
-      delete next[jid];
+      delete next[target];
       return next;
     });
     setNotice('Image attachment removed');
@@ -434,8 +644,7 @@ export function App({
       file,
       text: 'Loading preview…',
     });
-    const image = await imagePreview(file, columns - 10, rows - 11);
-    setModal((current) => (current?.file === file ? { ...current, image, text: '' } : current));
+    showImage(file, await renderImage(file));
   }
   async function pasteClipboard() {
     if (section === 'channels') {
@@ -473,7 +682,7 @@ export function App({
     if (result.resetAccount) {
       pages.current = {};
       readPending.current.clear();
-      setImageDrafts({});
+      setImageDrafts(() => ({}));
       setJid(undefined);
       setDraft('');
       setReply(undefined);
@@ -493,6 +702,16 @@ export function App({
     if (result.filter) setFilter(result.filter);
     if (result.results)
       show({ type: 'search', title: 'Search results · Enter to jump', results: result.results });
+    if (result.search)
+      show({
+        type: 'search',
+        title: result.search.jid
+          ? 'Search this conversation · Enter to jump'
+          : 'Search messages · Enter to jump',
+        scope: result.search.jid,
+        initial: result.search.query,
+      });
+    if (result.links) openLinks(result.links);
     if (result.reply) {
       setReply(result.reply);
       setFocus('composer');
@@ -504,19 +723,105 @@ export function App({
   }
   const execute = async (text: string) => {
     await task(async () => {
-      await apply(
-        await command(text, {
-          store,
-          client,
-          jid,
-          selected,
-          visible: visibleMessages,
-          settings,
-          section,
-        }),
-      );
+      await apply(await command(text, context()));
     });
   };
+  function openLinks(links: string[]) {
+    if (links.length === 1) {
+      void task(async () => {
+        await open(links[0]);
+        setNotice(`Opened ${links[0]}`);
+      });
+      return;
+    }
+    show({
+      type: 'menu',
+      title: 'Open a link',
+      items: links.map((link) => ({
+        label: link,
+        run: () =>
+          task(async () => {
+            await open(link);
+            setNotice(`Opened ${link}`);
+          }),
+      })),
+    });
+  }
+  function selectedLinks() {
+    const links = selected ? linksIn(selected.text) : [];
+    if (links.length) openLinks(links);
+    else setNotice('The selected message has no web links.');
+  }
+  function voteFor(message: Message, options: number[]) {
+    void task(async () => {
+      await client.vote(message, options);
+      const names = (pollOf(message.raw)?.options || []).map((o) => o.optionName);
+      setNotice(
+        options.length ? `Voted for ${options.map((i) => names[i]).join(', ')}` : 'Vote removed',
+      );
+    });
+  }
+  function voteMenu() {
+    const message = selected;
+    const poll = message && pollOf(message.raw);
+    if (!message || message.kind !== 'poll' || !poll) {
+      setNotice('Select a poll with ↑ / ↓ first.');
+      return;
+    }
+    const names = (poll.options || []).map((o) => o.optionName || '');
+    if (pollLimit(poll) !== 1) {
+      prompt(`Vote · option numbers separated by commas (1–${names.length})`, async (text) => {
+        voteFor(
+          message,
+          text
+            .split(/[,\s]+/)
+            .filter(Boolean)
+            .map((n) => Number(n) - 1),
+        );
+      });
+      return;
+    }
+    show({
+      type: 'menu',
+      title: `Vote · ${poll.name}`,
+      items: [
+        ...names.map((name, i) => ({
+          label: `${i + 1}. ${name}`,
+          run: () => voteFor(message, [i]),
+        })),
+        { label: 'Remove my vote', run: () => voteFor(message, []) },
+      ],
+    });
+  }
+  function cacheMenu() {
+    show({
+      type: 'menu',
+      title: 'Media cache',
+      items: [
+        { label: 'Show cache size', run: () => execute('/cache') },
+        { label: 'Clear downloaded media', run: () => execute('/cache clear') },
+      ],
+    });
+  }
+  function muteMenu() {
+    if (!jid) {
+      setNotice('Open a chat first.');
+      return;
+    }
+    if (isMuted(store.chat(jid))) {
+      void execute('/mute off');
+      return;
+    }
+    show({
+      type: 'menu',
+      title: 'Mute this chat',
+      items: [
+        ['8 hours', '8h'],
+        ['1 week', '1w'],
+        ['Always', 'always'],
+      ].map(([label, value]) => ({ label, run: () => execute(`/mute ${value}`) })),
+    });
+  }
   function prompt(title: string, submit: (text: string) => Promise<void>, initial = '') {
     show({
       type: 'prompt',
@@ -649,9 +954,25 @@ export function App({
           },
         },
         {
+          label: `Typing indicators: ${typingEnabled ? 'ON' : 'OFF'}`,
+          run: () => {
+            preferences({ ...settings, typing: !typingEnabled });
+            setNotice(`Typing indicators ${typingEnabled ? 'off' : 'on'}`);
+          },
+        },
+        {
           label: `Message notification bell: ${settings.notifications ? 'ON' : 'OFF'}`,
           run: () => {
             preferences({ ...settings, notifications: !settings.notifications });
+          },
+        },
+        {
+          label: `Image previews: ${settings.images || 'auto'}${!settings.images || settings.images === 'auto' ? ` (${graphics})` : ''}`,
+          run: () => {
+            const order = ['auto', 'kitty', 'blocks'] as const;
+            const next = order[(order.indexOf(settings.images || 'auto') + 1) % order.length];
+            preferences({ ...settings, images: next });
+            setNotice(`Image previews: ${next}`);
           },
         },
         {
@@ -696,6 +1017,7 @@ export function App({
             run: () => execute('/preview'),
           },
           { label: 'Open selected attachment', run: () => execute('/open-media') },
+          { label: 'Open a link from selected update            L', run: selectedLinks },
           { label: 'Update info', run: () => execute('/info') },
           { label: 'Bookmark selected update', run: () => execute('/star') },
           { label: 'Show bookmarked updates', run: () => execute('/stars') },
@@ -715,6 +1037,7 @@ export function App({
               }),
           },
           { label: 'Sync WhatsApp contact names', run: () => execute('/sync-contacts') },
+          { label: 'Media cache', run: cacheMenu },
           { label: 'Preferences', run: settingsMenu },
           { label: 'Keyboard guide', run: () => show({ type: 'info', title: 'Help', text: HELP }) },
           { label: 'Log out / link another account', run: logoutMenu },
@@ -753,6 +1076,8 @@ export function App({
           run: () => execute('/preview'),
         },
         { label: 'Open selected attachment externally', run: () => execute('/open-media') },
+        { label: 'Open a link from selected message           L', run: selectedLinks },
+        { label: 'Vote in selected poll                        V', run: voteMenu },
         { label: 'Send an attachment                           Ctrl+T', run: attachment },
         {
           label: 'Send a voice note from an Ogg/Opus file',
@@ -767,16 +1092,7 @@ export function App({
           label: 'Download selected attachment',
           run: () =>
             prompt('Save attachment · destination path (blank = cache)', async (path) => {
-              await apply(
-                await command(`/download "${path}"`, {
-                  store,
-                  client,
-                  selected,
-                  jid,
-                  settings,
-                  visible: visibleMessages,
-                }),
-              );
+              await apply(await command(`/download "${path}"`, context()));
             }),
         },
         {
@@ -820,7 +1136,12 @@ export function App({
         { label: 'Mark visible messages read', run: () => execute('/read') },
         { label: 'Archive / unarchive this chat', run: () => execute('/archive') },
         { label: 'Pin / unpin this chat', run: () => execute('/pin') },
-        { label: 'Mute / unmute this chat', run: () => execute('/mute') },
+        {
+          label: isMuted(jid ? store.chat(jid) : undefined)
+            ? 'Unmute this chat'
+            : 'Mute this chat (8 hours, 1 week, always)',
+          run: muteMenu,
+        },
         { label: 'Mark this chat unread', run: () => execute('/unread') },
         {
           label: 'Filter chats',
@@ -876,18 +1197,10 @@ export function App({
           label: 'Export this conversation',
           run: () =>
             prompt('Export conversation · destination .json path', async (path) => {
-              await apply(
-                await command(`/export "${path}"`, {
-                  store,
-                  client,
-                  jid,
-                  selected,
-                  settings,
-                  visible: visibleMessages,
-                }),
-              );
+              await apply(await command(`/export "${path}"`, context()));
             }),
         },
+        { label: 'Media cache', run: cacheMenu },
         { label: 'Preferences', run: settingsMenu },
         {
           label: 'Keyboard & command guide',
@@ -920,28 +1233,20 @@ export function App({
     const text = value;
     await task(async () => {
       if (text.startsWith('/') && !text.startsWith('//')) {
-        const result = await command(text, {
-          store,
-          client,
-          jid,
-          selected,
-          visible: visibleMessages,
-          settings,
-          section,
-        });
+        const result = await command(text, context());
         setDraft('');
         await apply(result);
       } else {
         if (!jid) throw new Error('Open a conversation first with Ctrl+K.');
-        if (pastedImage)
-          await client.sendFile(
+        const body = text.startsWith('//') ? text.slice(1) : text;
+        if (pastedImage) await client.sendFile(jid, pastedImage.path, body, false, reply);
+        else
+          await client.send(
             jid,
-            pastedImage.path,
-            text.startsWith('//') ? text.slice(1) : text,
-            false,
+            body,
             reply,
+            jid.endsWith('@g.us') ? mentionsIn(body, participants) : undefined,
           );
-        else await client.send(jid, text.startsWith('//') ? text.slice(1) : text, reply);
         if (pastedImage)
           setImageDrafts((previous) => {
             const next = { ...previous };
@@ -953,7 +1258,7 @@ export function App({
         setOffset(0);
         setSelectedId(null);
         setNotice(pastedImage ? 'Image sent' : 'Message sent');
-        void client.typing(jid, false).catch(() => {});
+        if (typingEnabled) void client.typing(jid, false).catch(() => {});
       }
     });
   }
@@ -981,15 +1286,15 @@ export function App({
         if (key.upArrow || key.pageUp) setModalScroll((n) => Math.max(0, n - (key.pageUp ? 8 : 1)));
         if (modal.file && input.toLowerCase() === 'o')
           void task(async () => {
-            await open(modal.file!);
+            await openExternally(modal.file!);
           });
         return;
       }
       const items =
         modal.type === 'chats'
-          ? store.directory(modalInput, section)
+          ? directory
           : modal.type === 'search'
-            ? modal.results || (modalInput ? store.search(modalInput, modal.query, section) : [])
+            ? searchResults
             : modal.items || [];
       if (key.upArrow) {
         setModalIndex((i) => Math.max(0, i - 1));
@@ -1031,16 +1336,21 @@ export function App({
         return;
       }
       if (modal.type === 'menu') return;
-      if ((key.ctrl && input === 'w') || ((key.ctrl || key.meta) && key.backspace)) {
-        setModalInput((s) => deleteWordAtCursor(s, Array.from(s).length, true).value);
+      const edit =
+        (key.ctrl && input === 'w') || ((key.ctrl || key.meta) && key.backspace)
+          ? (s: string) => deleteWordAtCursor(s, Array.from(s).length, true).value
+          : key.backspace
+            ? (s: string) => deleteAtCursor(s, Array.from(s).length, true).value
+            : key.ctrl && input === 'u'
+              ? () => ''
+              : !key.ctrl && !key.meta && !key.tab && input
+                ? (s: string) => s + safeText(input).replace(/\n/g, '')
+                : undefined;
+      if (edit) {
+        // A new query starts again from its first page.
+        setModalInput(edit);
         setModalIndex(0);
-      } else if (key.backspace) {
-        setModalInput((s) => deleteAtCursor(s, Array.from(s).length, true).value);
-        setModalIndex(0);
-      } else if (key.ctrl && input === 'u') setModalInput('');
-      else if (!key.ctrl && !key.meta && !key.tab && input) {
-        setModalInput((s) => s + safeText(input).replace(/\n/g, ''));
-        setModalIndex(0);
+        setSearchPages(1);
       }
       return;
     }
@@ -1060,7 +1370,7 @@ export function App({
       return;
     }
     if (key.ctrl && input === 'f') {
-      show({ type: 'search', title: 'Search messages · Enter to jump', query: jid });
+      show({ type: 'search', title: 'Search messages · Enter to jump', scope: jid });
       return;
     }
     if (key.ctrl && input === 'g') {
@@ -1103,27 +1413,23 @@ export function App({
         return;
       }
     }
-    const currentPicker = emojiPicker(value, cursor);
+    const currentPicker = suggestionPicker(value, cursor);
     if (currentPicker && !key.ctrl && (!key.meta || key.escape)) {
       if (key.escape) {
-        emojiRef.current.dismissed = currentPicker.token.key;
-        refreshEmoji((n) => n + 1);
+        suggestRef.current.dismissed = currentPicker.key;
+        refreshSuggestions((n) => n + 1);
         return;
       }
       if (key.upArrow || key.downArrow) {
-        emojiRef.current.key = currentPicker.token.key;
-        emojiRef.current.index =
+        suggestRef.current.key = currentPicker.key;
+        suggestRef.current.index =
           (currentPicker.index + (key.upArrow ? currentPicker.items.length - 1 : 1)) %
           currentPicker.items.length;
-        refreshEmoji((n) => n + 1);
+        refreshSuggestions((n) => n + 1);
         return;
       }
       if (key.tab || key.return) {
-        const next = insertEmoji(
-          value,
-          currentPicker.token,
-          currentPicker.items[currentPicker.index].emoji,
-        );
+        const next = currentPicker.insert(currentPicker.index);
         setValue(next.value);
         setCursor(next.cursor);
         return;
@@ -1194,6 +1500,8 @@ export function App({
       else if (key.return || input === 'a') actions();
       else if (input === 'r') void execute('/reply');
       else if (input === 'p') void execute('/preview');
+      else if (input === 'l') selectedLinks();
+      else if (input === 'v' && section === 'chats') voteMenu();
       else if (input === 'i' && section === 'chats') setFocus('composer');
       else if (key.end) {
         setOffset(0);
@@ -1224,10 +1532,6 @@ export function App({
     if (key.ctrl && input === 'u') {
       setValue(Array.from(value).slice(cursor).join(''));
       setCursor(0);
-      return;
-    }
-    if (key.ctrl && input === 'k') {
-      setValue(Array.from(value).slice(0, cursor).join(''));
       return;
     }
     if (key.upArrow && !value) {
@@ -1267,7 +1571,7 @@ export function App({
       setValue(c.join(''));
       setCursor(cursor + Array.from(clean).length);
     }
-  });
+  }, setTerminalFocused);
 
   const modalHeight = rows - 7 - +syncVisible;
   function modalContent() {
@@ -1299,18 +1603,18 @@ export function App({
       );
     const list: MenuItem[] =
       modal.type === 'chats'
-        ? store.directory(modalInput, section).map((c) => ({
+        ? directory.map((c) => ({
             label: `${c.name}${c.unread ? ` (${c.unread})` : ''} · ${c.jid}`,
             run: () => {},
           }))
         : modal.type === 'search'
-          ? (
-              modal.results || (modalInput ? store.search(modalInput, modal.query, section) : [])
-            ).map((m) => ({
+          ? searchResults.map((m) => ({
               label: `${store.name(m.jid)} · ${m.text.replace(/\n/g, ' ')}`,
               run: () => {},
             }))
           : modal.items || [];
+    const morePages =
+      modal.type === 'search' && !modal.results && list.length === searchPages * SEARCH_PAGE;
     const available = modalHeight - (modal.type === 'menu' ? 5 : 7);
     const start = Math.max(0, modalIndex - available + 1);
     return (
@@ -1319,7 +1623,8 @@ export function App({
           <>
             <Text color={accent}>⌕ {modalInput}▌</Text>
             <Text color={muted}>
-              {list.length} results{' '}
+              {list.length}
+              {morePages ? '+' : ''} results{' '}
               {modal.type === 'chats'
                 ? section === 'channels'
                   ? '· synced channels only'
@@ -1348,7 +1653,7 @@ export function App({
         <Box flexGrow={1} />
         <Text color={muted}>
           ↑ ↓ select · Enter confirm · Esc close
-          {start + available < list.length ? ' · more below ↓' : ''}
+          {start + available < list.length || morePages ? ' · more below ↓' : ''}
         </Text>
       </>
     );
@@ -1515,7 +1820,7 @@ export function App({
                       }
                     >
                       {pad(
-                        `${chat.jid === jid ? '›' : chat.jid.endsWith('@g.us') ? '#' : section === 'channels' ? '~' : '·'} ${chat.pinned ? '◆ ' : ''}${fit(chat.name, sidebarWidth - 8 - (chat.unread ? String(chat.unread).length + 2 : 0))}${chat.unread ? `  ${chat.unread}` : ''}`,
+                        `${chat.jid === jid ? '›' : chat.jid.endsWith('@g.us') ? '#' : section === 'channels' ? '~' : '·'} ${chatIcons(chat)}${fit(chat.name, sidebarWidth - 8 - chatIcons(chat).length - (chat.unread ? String(chat.unread).length + 2 : 0))}${chat.unread ? `  ${chat.unread}` : ''}`,
                         sidebarWidth - 4,
                       )}
                     </Text>
@@ -1615,7 +1920,8 @@ export function App({
         </Text>
       )}
       {picker && (
-        <EmojiSuggestions
+        <Suggestions
+          title={picker.title}
           items={picker.items}
           index={picker.index}
           count={emojiRows}

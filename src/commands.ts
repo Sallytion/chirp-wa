@@ -1,11 +1,23 @@
 import { copyFile, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
-import open from 'open';
-import { getAggregateVotesInPollMessage, normalizeMessageContent } from '@whiskeysockets/baileys';
 import type { Client, Message, Settings } from './types.js';
+import { isMuted } from './types.js';
 import type { Store } from './store.js';
 import { isChannel, type ChatSection } from './conversations.js';
-import { jidFor, tokens } from './util.js';
+import { jidFor, linksIn, tokens } from './util.js';
+import { pollOf, pollTally } from './messages.js';
+import { clearMediaCache, formatBytes, mediaCacheUsage, openExternally } from './media.js';
+
+const muteDurations: Record<string, number> = { h: 3600, d: 86400, w: 604800 };
+// "8h", "1w", "always" or "off"; seconds for Client.mute (-1 always, null off).
+export function muteDuration(value: string): number | null {
+  const text = value.toLowerCase();
+  if (text === 'always') return -1;
+  if (text === 'off') return null;
+  const match = /^(\d{1,4})([hdw])$/.exec(text);
+  if (!match || !+match[1]) throw new Error('/mute 8h | 1w | always | off');
+  return +match[1] * muteDurations[match[2]];
+}
 
 export const HELP = `NAVIGATION · Control shortcuts work on Windows, Linux, and macOS
 Ctrl+N          Switch Chats (direct + groups) / Channels
@@ -15,11 +27,13 @@ PageUp / PageDn Browse cached history · Home / End in messages jump to oldest /
 Ctrl+K          Search / switch chats · Ctrl+F searches this conversation
 Alt+U           Jump to next unread chat · Esc returns to composer
 Ctrl+P          Preview selected attachment or pasted image
+Messages focus  Enter actions · R reply · P preview · L open link · V vote
 Ctrl+R          Reply to selected message · Ctrl+T attach a file
 Ctrl+V          Paste clipboard image or text (also in the Ctrl+G menu)
 Ctrl+G          Actions, bookmarks, receipts, help, and logout
 Enter           Send · Alt+Enter or Ctrl+J inserts a newline
 :smile          Emoji suggestions · ↑ / ↓ select · Tab / Enter insert · Esc dismiss
+@name           Mention suggestions in groups (inserts @number, shown as names)
 Backspace / Del Delete previous / next character (including complete emoji)
 Ctrl+W          Delete previous word · Ctrl+Backspace / Option+Backspace aliases
 Ctrl+Delete     Delete next word · Ctrl+← / → move by word
@@ -36,13 +50,15 @@ COMMANDS
 /chats [all|unread|groups|archived]     Change sidebar filter
 /channels [all|unread|archived]        Open the separate channels page
 /sync-contacts                        Sync WhatsApp contact names
-/search text                          Search all cached messages
+/search text                          Search all cached messages (scroll for more)
 /find text                            Search this conversation
 /history                              Request older history from your phone
 /attach "path" [caption]              Send image, video, audio, or document
 /voice "recording.ogg"                Send an existing Ogg/Opus voice note
 /preview · /open-media                Preview or open selected media
 /download ["destination"]             Cache or copy the selected attachment
+/links                                Open a web link from the selected message
+/cache [clear]                        Show or clear downloaded media
 /reply [message-id] · /cancel          Reply to selection, or cancel reply
 /react emoji                          React to selection ("" removes yours)
 /edit replacement text                Edit your selected text message
@@ -53,8 +69,10 @@ COMMANDS
 /info                                 Message delivery details and reactions
 /star                                 Toggle a local bookmark
 /stars                                Search local bookmarks in this chat
-/archive · /pin · /mute · /unread      Chat actions (synced to WhatsApp)
+/archive · /pin · /unread              Chat actions (synced to WhatsApp)
+/mute [8h|1w|always|off]               Mute this chat (no argument toggles)
 /poll "Question" "Option 1" "Option 2" Create a single-choice poll
+/vote 2 · /vote 1,3 · /vote clear      Vote in the selected poll
 /group info                           Group details and members
 /group create "Name" +number […]      Create a group
 /group add|remove|promote|demote +num   Manage participants
@@ -65,6 +83,8 @@ COMMANDS
 /settings                             Show preferences
 /receipts on|off                       Automatic receipts for visible messages
 /notifications on|off                  Terminal bell for incoming messages
+/typing on|off                         Send typing indicators
+/images auto|kitty|blocks              Image previews (kitty graphics or blocks)
 /theme dark|light                      Change palette
 /export "path.json"                    Export this cached conversation
 /logout confirm                       Unlink and archive this account; Q links another
@@ -81,6 +101,9 @@ export interface CommandContext {
   visible: Message[];
   settings: Settings;
   section?: ChatSection;
+  // Profile directory and unsent attachment drafts that /cache clear must keep.
+  dir?: string;
+  keep?: string[];
 }
 export interface CommandResult {
   notice?: string;
@@ -89,6 +112,9 @@ export interface CommandResult {
   filter?: string;
   section?: ChatSection;
   results?: Message[];
+  // A paged search the dialog continues as you scroll.
+  search?: { query: string; jid?: string };
+  links?: string[];
   reply?: Message;
   cancelReply?: boolean;
   preview?: Message;
@@ -139,9 +165,9 @@ export async function command(input: string, ctx: CommandContext): Promise<Comma
     case '/sync-contacts':
       return { notice: await client.syncContacts() };
     case '/search':
-      return { results: store.search(argText(), undefined, ctx.section) };
+      return { search: { query: argText() } };
     case '/find':
-      return { results: store.search(argText(), requireJid()) };
+      return { search: { query: argText(), jid: requireJid() } };
     case '/history':
       await client.history(
         requireJid(),
@@ -156,8 +182,31 @@ export async function command(input: string, ctx: CommandContext): Promise<Comma
     case '/preview':
       return { preview: selected() };
     case '/open-media':
-      await open(await client.download(selected()));
+      await openExternally(await client.download(selected()));
       return { notice: 'Opened in your default application' };
+    case '/links': {
+      const links = linksIn(selected().text);
+      if (!links.length) throw new Error('The selected message has no web links.');
+      return { links };
+    }
+    case '/cache': {
+      const dir = ctx.dir;
+      if (!dir) throw new Error('No profile directory.');
+      if (args[0] === 'clear') {
+        const cleared = await clearMediaCache(dir, ctx.keep);
+        return {
+          notice: `Cleared ${cleared.files} cached files (${formatBytes(cleared.bytes)}). Attachments download again when opened.`,
+        };
+      }
+      if (args[0]) throw new Error('/cache [clear]');
+      const usage = await mediaCacheUsage(dir);
+      return {
+        info: {
+          title: 'Media cache',
+          text: `${usage.files} files · ${formatBytes(usage.bytes)}\n\nDownloaded attachments are kept so previews open instantly.\n/cache clear removes them; they download again when opened.`,
+        },
+      };
+    }
     case '/download': {
       const path = await client.download(selected());
       if (args[0]) {
@@ -210,20 +259,16 @@ export async function command(input: string, ctx: CommandContext): Promise<Comma
         ([user, r]) =>
           `${store.name(user)}: ${r.played ? 'played' : r.read ? 'read' : 'delivered'} at ${new Date((r.played || r.read || r.delivered || 0) * 1000).toLocaleString()}`,
       );
-      let poll = '';
-      const content = normalizeMessageContent(m.raw.message);
-      if (m.kind === 'poll') {
-        try {
-          poll =
-            '\nPoll results (received votes):\n' +
-            getAggregateVotesInPollMessage({
-              message: content,
-              pollUpdates: m.raw.pollUpdates || [],
-            })
-              .map((o) => `${o.name}: ${o.voters.length}`)
-              .join('\n');
-        } catch {}
-      }
+      const poll =
+        m.kind === 'poll'
+          ? '\n\nPoll results (received votes):\n' +
+            pollTally(m.raw)
+              .map(
+                (o) =>
+                  `${o.name}: ${o.voters.length}${o.voters.length ? ` · ${o.voters.map((v) => (v === 'me' ? 'You' : store.name(v))).join(', ')}` : ''}`,
+              )
+              .join('\n')
+          : '';
       return {
         info: {
           title: 'Message info',
@@ -241,35 +286,58 @@ export async function command(input: string, ctx: CommandContext): Promise<Comma
       return { notice: m.starred ? 'Local bookmark removed' : 'Bookmarked locally' };
     }
     case '/stars':
-      return {
-        results: store
-          .allMessages(requireJid())
-          .filter((m) => m.starred)
-          .reverse()
-          .slice(0, 100),
-      };
+      return { results: store.starred(requireJid()) };
     case '/archive':
     case '/pin':
-    case '/mute':
     case '/unread': {
       const jid = requireJid();
       const chat = store.chat(jid);
-      const action = name.slice(1) as 'archive' | 'pin' | 'mute' | 'unread';
+      const action = name.slice(1) as 'archive' | 'pin' | 'unread';
       const value =
-        action === 'archive'
-          ? !chat?.archived
-          : action === 'pin'
-            ? !chat?.pinned
-            : action === 'mute'
-              ? !chat?.muted
-              : true;
+        action === 'archive' ? !chat?.archived : action === 'pin' ? !chat?.pinned : true;
       await client.modifyChat(jid, action, value);
       return { notice: `Chat ${action} updated` };
+    }
+    case '/mute': {
+      const jid = requireJid();
+      const seconds = args[0] ? muteDuration(args[0]) : isMuted(store.chat(jid)) ? null : -1;
+      await client.mute(jid, seconds);
+      return {
+        notice:
+          seconds == null
+            ? 'Chat unmuted'
+            : seconds < 0
+              ? 'Chat muted · always'
+              : `Chat muted until ${new Date(Date.now() + seconds * 1000).toLocaleString()}`,
+      };
     }
     case '/poll':
       if (args.length < 3) throw new Error('/poll "Question" "Option 1" "Option 2"');
       await client.poll(requireJid(), args[0], args.slice(1));
       return { notice: 'Poll sent' };
+    case '/vote': {
+      const m = selected();
+      const poll = pollOf(m.raw);
+      if (m.kind !== 'poll' || !poll) throw new Error('Select a poll with ↑ / ↓ first.');
+      if (!args.length) throw new Error('/vote 2 · /vote 1,3 · /vote clear');
+      const options =
+        args[0] === 'clear'
+          ? []
+          : args
+              .join(',')
+              .split(/[,\s]+/)
+              .filter(Boolean)
+              .map((n) => {
+                if (!/^\d+$/.test(n)) throw new Error('/vote takes option numbers, e.g. /vote 2');
+                return +n - 1;
+              });
+      await client.vote(m, options);
+      return {
+        notice: options.length
+          ? `Voted for ${options.map((i) => poll.options?.[i]?.optionName).join(', ')}`
+          : 'Vote removed',
+      };
+    }
     case '/group': {
       const text = await client.group(ctx.jid || '', args[0] || 'info', args.slice(1));
       return { info: { title: 'Group', text } };
@@ -278,20 +346,27 @@ export async function command(input: string, ctx: CommandContext): Promise<Comma
       return {
         info: {
           title: 'Preferences',
-          text: `Automatic visible-message receipts: ${settings.autoRead ? 'on' : 'off'}\nTerminal bell: ${settings.notifications ? 'on' : 'off'}\nTheme: ${settings.theme}\n\n/receipts on|off\n/notifications on|off\n/theme dark|light\n\nLocal history and credentials are stored in this profile.\nDisabling automatic receipts does not change your WhatsApp account privacy settings.`,
+          text: `Automatic visible-message receipts: ${settings.autoRead ? 'on' : 'off'} (paused while the terminal is unfocused)\nTyping indicators: ${settings.typing !== false ? 'on' : 'off'}\nTerminal bell: ${settings.notifications ? 'on' : 'off'}\nImage previews: ${settings.images || 'auto'}\nTheme: ${settings.theme}\n\n/receipts on|off\n/typing on|off\n/notifications on|off\n/images auto|kitty|blocks\n/theme dark|light\n\nLocal history and credentials are stored in this profile.\nDisabling automatic receipts does not change your WhatsApp account privacy settings.`,
         },
       };
     case '/receipts':
+    case '/typing':
     case '/notifications': {
       if (!['on', 'off'].includes(args[0])) throw new Error(`${name} on|off`);
+      const key =
+        name === '/receipts' ? 'autoRead' : name === '/typing' ? 'typing' : 'notifications';
       return {
-        settings: {
-          ...settings,
-          [name === '/receipts' ? 'autoRead' : 'notifications']: args[0] === 'on',
-        },
+        settings: { ...settings, [key]: args[0] === 'on' },
         notice: `${name.slice(1)} ${args[0]}`,
       };
     }
+    case '/images':
+      if (!['auto', 'kitty', 'blocks'].includes(args[0]))
+        throw new Error('/images auto|kitty|blocks');
+      return {
+        settings: { ...settings, images: args[0] as 'auto' | 'kitty' | 'blocks' },
+        notice: `Image previews: ${args[0]}`,
+      };
     case '/theme':
       if (!['dark', 'light'].includes(args[0])) throw new Error('/theme dark|light');
       return { settings: { ...settings, theme: args[0] as 'dark' | 'light' } };
